@@ -1,0 +1,27 @@
+# ==============================================================================
+# aws-auth ConfigMap patch example
+# ==============================================================================
+# Add this entry to the mapRoles section of the aws-auth ConfigMap in each
+# EKS cluster. Replace <ACCOUNT_ID> with the workload account ID.
+#
+# If you're using EKS Access Entries (1.28+), use that instead — it's cleaner.
+#
+# kubectl edit configmap aws-auth -n kube-system
+# ==============================================================================
+#
+# mapRoles: |
+#   ... existing entries ...
+#   - rolearn: arn:aws:iam::<ACCOUNT_ID>:role/GitLabDDKeyRotationRole
+#     username: dd-key-rotation
+#     groups:
+#       - dd-key-rotation-group
+#
+
+# ==============================================================================
+# EKS Access Entry alternative (preferred):
+# ==============================================================================
+# aws eks create-access-entry \
+#   --cluster-name <CLUSTER_NAME> \
+#   --principal-arn arn:aws:iam::<ACCOUNT_ID>:role/GitLabDDKeyRotationRole \
+#   --kubernetes-groups dd-key-rotation-group \
+#   --type STANDARD

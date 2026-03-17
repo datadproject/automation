@@ -1,0 +1,82 @@
+# ==============================================================================
+# CloudFormation template — Cross-Account IAM Role for DD Key Rotation
+# ==============================================================================
+# NOTE: Your existing pipeline already uses NGDCGitLabTerraformAdminRole.
+# If that role has sufficient EKS + K8s permissions, you do NOT need this
+# template — just reuse the existing role in clusters.yml.
+#
+# This template is provided in case you want a SEPARATE, least-privilege role
+# dedicated to key rotation only.
+#
+# Deploy via StackSets from the management account for scale:
+#   aws cloudformation create-stack-set \
+#     --stack-set-name dd-key-rotation-role \
+#     --template-body file://iam/cross-account-role.yml \
+#     --parameters ParameterKey=ManagementAccountId,ParameterValue=<YOUR_MGMT_ACCT_ID> \
+#                  ParameterKey=EksClusterName,ParameterValue=<CLUSTER_NAME> \
+#     --permission-model SERVICE_MANAGED \
+#     --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false
+# ==============================================================================
+AWSTemplateFormatVersion: "2010-09-09"
+Description: IAM role for GitLab-based Datadog API key rotation (GovCloud)
+
+Parameters:
+  ManagementAccountId:
+    Type: String
+    Description: AWS GovCloud account ID where the GitLab runner lives
+    AllowedPattern: "[0-9]{12}"
+
+  EksClusterName:
+    Type: String
+    Description: Name of the EKS cluster in this account
+
+  ExternalId:
+    Type: String
+    Description: External ID for cross-account assume role (shared secret)
+    NoEcho: true
+    Default: ""
+
+Resources:
+  GitLabDDKeyRotationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: GitLabDDKeyRotationRole
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws-us-gov:iam::${ManagementAccountId}:root"
+            Action: "sts:AssumeRole"
+            Condition: !If
+              - HasExternalId
+              - StringEquals:
+                  "sts:ExternalId": !Ref ExternalId
+              - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: EksDescribeAndKubeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EksDescribe
+                Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:ListClusters
+                Resource: !Sub "arn:aws-us-gov:eks:*:${AWS::AccountId}:cluster/${EksClusterName}"
+      Tags:
+        - Key: Purpose
+          Value: datadog-key-rotation
+        - Key: ManagedBy
+          Value: cloudformation
+
+Conditions:
+  HasExternalId: !Not [!Equals [!Ref ExternalId, ""]]
+
+Outputs:
+  RoleArn:
+    Description: ARN of the cross-account rotation role
+    Value: !GetAtt GitLabDDKeyRotationRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RoleArn"
