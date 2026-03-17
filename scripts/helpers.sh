@@ -23,21 +23,29 @@ log_error() { echo "[ERROR] $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*" >&2; }
 parse_clusters() {
   local config_file="${1:-config/clusters.yml}"
 
-  yq eval -o=json '
-    .clusters[] as $c |
-    {
-      "name":            $c.name,
-      "aws_account_id":  $c.aws_account_id,
-      "aws_region":      $c.aws_region,
-      "cluster_name":    $c.cluster_name,
-      "role_arn":         $c.role_arn,
-      "namespace":       ($c.namespace // .defaults.namespace),
-      "secret_name":     ($c.secret_name // .defaults.secret_name),
-      "secret_key":      ($c.secret_key // .defaults.secret_key),
-      "role_session_name": ($c.role_session_name // .defaults.role_session_name),
-      "tags":            ($c.tags // [])
-    }
-  ' "$config_file" | jq -s '.'
+  python3 -c "
+import yaml, json, sys
+
+with open('${config_file}') as f:
+    data = yaml.safe_load(f)
+
+defaults = data.get('defaults', {})
+result = []
+for c in data.get('clusters', []):
+    result.append({
+        'name':              c['name'],
+        'aws_account_id':    c['aws_account_id'],
+        'aws_region':        c['aws_region'],
+        'cluster_name':      c['cluster_name'],
+        'role_arn':           c['role_arn'],
+        'namespace':         c.get('namespace', defaults.get('namespace', 'datadog')),
+        'secret_name':       c.get('secret_name', defaults.get('secret_name', 'datadog-secret')),
+        'secret_key':        c.get('secret_key', defaults.get('secret_key', 'api-key')),
+        'role_session_name': c.get('role_session_name', defaults.get('role_session_name', 'gitlab-ci')),
+        'tags':              c.get('tags', [])
+    })
+print(json.dumps(result))
+"
 }
 
 # ------------------------------------------------------------------------------
