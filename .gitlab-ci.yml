@@ -90,6 +90,11 @@ prepare-rollout-only:
     - |
       log_info "ROLLOUT_ONLY mode — using current GITLAB_DATADOG_API_TOKEN for targeted rollout"
       log_info "CLUSTER_FILTER: ${CLUSTER_FILTER:-all}"
+      if [ -z "${GITLAB_DATADOG_API_TOKEN:-}" ]; then
+        log_error "GITLAB_DATADOG_API_TOKEN is not set. Cannot proceed with rollout-only mode."
+        exit 1
+      fi
+      log_info "GITLAB_DATADOG_API_TOKEN is set (length: ${#GITLAB_DATADOG_API_TOKEN}, last4: ${GITLAB_DATADOG_API_TOKEN: -4})"
       jq -n \
         --arg new_key "$GITLAB_DATADOG_API_TOKEN" \
         --arg mode "rollout_only" \
@@ -172,6 +177,7 @@ verify-clusters:
       - rotation_state.json
     expire_in: 7 days
   needs:
+    - job: rollout-clusters
     - job: generate-rollout-matrix
       artifacts: true
   rules:
