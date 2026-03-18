@@ -17,7 +17,7 @@ source "${SCRIPT_DIR}/helpers.sh"
 
 DD_API_BASE="https://api.ddog-gov.com"
 ROTATION_STATE_FILE="${ROTATION_STATE_FILE:-${CI_PROJECT_DIR:-$(pwd)}/rotation_state.json}"
-CONFIG_FILE="${CONFIG_FILE:-config/clusters.yml}"
+CONFIG_FILE="${CONFIG_FILE:-config/clusters.json}"
 
 # How long to wait for hosts to report (default: 10 minutes)
 VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-600}"
