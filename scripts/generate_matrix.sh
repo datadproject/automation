@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# generate_matrix.sh — Generate GitLab CI parallel job matrix from clusters.yml
+# generate_matrix.sh — Generate GitLab CI parallel job matrix from clusters.json
 # ==============================================================================
 # Reads the cluster inventory and outputs a JSON array suitable for GitLab CI
 # parallel:matrix dynamic child pipeline or dotenv artifacts.
@@ -10,7 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/helpers.sh"
 
-CONFIG_FILE="${CONFIG_FILE:-config/clusters.yml}"
+CONFIG_FILE="${CONFIG_FILE:-config/clusters.json}"
 
 main() {
   local all_clusters
