@@ -17,35 +17,24 @@ log_warn()  { echo "[WARN]  $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*" >&2; }
 log_error() { echo "[ERROR] $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*" >&2; }
 
 # ------------------------------------------------------------------------------
-# Parse clusters.yml — requires yq v4+
+# Parse clusters.json — requires yq v4+
 # Outputs JSON array of cluster objects with defaults merged.
 # ------------------------------------------------------------------------------
 parse_clusters() {
-  local config_file="${1:-config/clusters.yml}"
+  local config_file="${1:-config/clusters.json}"
 
-  python3 -c "
-import yaml, json, sys
-
-with open('${config_file}') as f:
-    data = yaml.safe_load(f)
-
-defaults = data.get('defaults', {})
-result = []
-for c in data.get('clusters', []):
-    result.append({
-        'name':              c['name'],
-        'aws_account_id':    c['aws_account_id'],
-        'aws_region':        c['aws_region'],
-        'cluster_name':      c['cluster_name'],
-        'role_arn':           c['role_arn'],
-        'namespace':         c.get('namespace', defaults.get('namespace', 'datadog')),
-        'secret_name':       c.get('secret_name', defaults.get('secret_name', 'datadog-secret')),
-        'secret_key':        c.get('secret_key', defaults.get('secret_key', 'api-key')),
-        'role_session_name': c.get('role_session_name', defaults.get('role_session_name', 'gitlab-ci')),
-        'tags':              c.get('tags', [])
-    })
-print(json.dumps(result))
-"
+  jq '[.defaults as $d | .clusters[] | {
+    name,
+    aws_account_id,
+    aws_region,
+    cluster_name,
+    role_arn,
+    namespace:         (.namespace // $d.namespace // "datadog"),
+    secret_name:       (.secret_name // $d.secret_name // "datadog-secret"),
+    secret_key:        (.secret_key // $d.secret_key // "api-key"),
+    role_session_name: (.role_session_name // $d.role_session_name // "gitlab-ci"),
+    tags:              (.tags // [])
+  }]' "$config_file"
 }
 
 # ------------------------------------------------------------------------------
@@ -100,7 +89,7 @@ filter_clusters() {
   log_info "Filter matched ${count} cluster(s)"
 
   if [[ "$count" -eq 0 ]]; then
-    log_error "CLUSTER_FILTER '${filter}' matched zero clusters. Check filter and clusters.yml."
+    log_error "CLUSTER_FILTER '${filter}' matched zero clusters. Check filter and clusters.json."
     return 1
   fi
 
