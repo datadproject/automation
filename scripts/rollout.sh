@@ -16,7 +16,7 @@
 #   K8S_NAMESPACE      — Namespace where DD secret lives (default: datadog)
 #   K8S_SECRET_NAME    — K8s secret name (default: datadog-secret)
 #   K8S_SECRET_KEY     — Key in the secret data map (default: api-key)
-#   ROTATION_STATE_FILE — Path to rotation state JSON from stage 1
+#   NEW_DD_API_KEY     — The new API key (injected by generate_matrix.sh)
 # ==============================================================================
 set -euo pipefail
 
@@ -26,7 +26,6 @@ source "${SCRIPT_DIR}/helpers.sh"
 K8S_NAMESPACE="${K8S_NAMESPACE:-datadog}"
 K8S_SECRET_NAME="${K8S_SECRET_NAME:-datadog-secret}"
 K8S_SECRET_KEY="${K8S_SECRET_KEY:-api-key}"
-ROTATION_STATE_FILE="${ROTATION_STATE_FILE:-${CI_PROJECT_DIR:-$(pwd)}/rotation_state.json}"
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-300s}"
 
 # ------------------------------------------------------------------------------
@@ -35,6 +34,14 @@ ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-300s}"
 # ------------------------------------------------------------------------------
 update_secret() {
   local new_key="$1"
+
+  # Debug: confirm we have an actual key value, not a variable reference
+  log_info "NEW_DD_API_KEY length: ${#new_key} chars, last4: ${new_key: -4}"
+  if [[ "$new_key" == *"GITLAB"* || "$new_key" == *"TOKEN"* || "$new_key" == *"{"* ]]; then
+    log_error "NEW_DD_API_KEY contains a variable reference instead of actual key value!"
+    log_error "Value looks like a literal variable name. Check child-pipeline.yml generation."
+    exit 1
+  fi
 
   log_info "Updating secret ${K8S_NAMESPACE}/${K8S_SECRET_NAME} key=${K8S_SECRET_KEY}"
 
@@ -50,7 +57,78 @@ update_secret() {
     --from-literal="${K8S_SECRET_KEY}=${new_key}" \
     -n "$K8S_NAMESPACE"
 
-  log_info "Secret updated successfully."
+  # Verify what was actually written
+  local written_key
+  written_key=$(kubectl get secret "$K8S_SECRET_NAME" -n "$K8S_NAMESPACE" \
+    -o jsonpath="{.data.${K8S_SECRET_KEY}}" | base64 -d)
+  log_info "Secret written. Verify last4: ${written_key: -4}"
+
+  log_info "Secret ${K8S_SECRET_NAME} updated successfully."
+
+  # Also update any OTHER secrets referenced by the DatadogAgent CR (operator)
+  update_operator_secret "$new_key"
+}
+
+# ------------------------------------------------------------------------------
+# Check if Datadog Operator's DatadogAgent CR references a different secret.
+# If so, update that secret too.
+# ------------------------------------------------------------------------------
+update_operator_secret() {
+  local new_key="$1"
+
+  # Check if a DatadogAgent CR exists
+  local dda_name
+  dda_name=$(kubectl get datadogagent -n "$K8S_NAMESPACE" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+  if [[ -z "$dda_name" ]]; then
+    log_info "No DatadogAgent CR found — skipping operator secret check."
+    return 0
+  fi
+
+  log_info "Found DatadogAgent CR: ${dda_name}"
+
+  # Get the secret name the operator uses for the API key
+  local operator_secret_name operator_secret_key
+  operator_secret_name=$(kubectl get datadogagent "$dda_name" -n "$K8S_NAMESPACE" \
+    -o jsonpath='{.spec.credentials.apiSecret.secretName}' 2>/dev/null || true)
+  operator_secret_key=$(kubectl get datadogagent "$dda_name" -n "$K8S_NAMESPACE" \
+    -o jsonpath='{.spec.credentials.apiSecret.keyName}' 2>/dev/null || true)
+
+  # Fallback: check under spec.global.credentials (newer operator versions)
+  if [[ -z "$operator_secret_name" ]]; then
+    operator_secret_name=$(kubectl get datadogagent "$dda_name" -n "$K8S_NAMESPACE" \
+      -o jsonpath='{.spec.global.credentials.apiSecret.secretName}' 2>/dev/null || true)
+    operator_secret_key=$(kubectl get datadogagent "$dda_name" -n "$K8S_NAMESPACE" \
+      -o jsonpath='{.spec.global.credentials.apiSecret.keyName}' 2>/dev/null || true)
+  fi
+
+  # Default key name if not specified
+  operator_secret_key="${operator_secret_key:-api-key}"
+
+  if [[ -z "$operator_secret_name" ]]; then
+    log_info "DatadogAgent CR does not specify a separate apiSecret — using default secret."
+    return 0
+  fi
+
+  # If the operator uses the same secret we already updated, skip
+  if [[ "$operator_secret_name" == "$K8S_SECRET_NAME" ]]; then
+    log_info "Operator uses same secret (${K8S_SECRET_NAME}) — already updated."
+    return 0
+  fi
+
+  # Update the operator's secret too
+  log_info "Operator uses different secret: ${operator_secret_name} key=${operator_secret_key}"
+  log_info "Updating operator secret..."
+
+  if kubectl get secret "$operator_secret_name" -n "$K8S_NAMESPACE" &>/dev/null; then
+    kubectl delete secret "$operator_secret_name" -n "$K8S_NAMESPACE"
+  fi
+
+  kubectl create secret generic "$operator_secret_name" \
+    --from-literal="${operator_secret_key}=${new_key}" \
+    -n "$K8S_NAMESPACE"
+
+  log_info "Operator secret ${operator_secret_name} updated."
 }
 
 # ------------------------------------------------------------------------------
@@ -135,18 +213,10 @@ health_check() {
 main() {
   log_info "========== Stage 2: Rollout to ${CLUSTER_NAME} (${AWS_REGION}) =========="
 
-  setup_proxy
+  local new_key="${NEW_DD_API_KEY:-}"
 
-  if [[ ! -f "$ROTATION_STATE_FILE" ]]; then
-    log_error "Rotation state file not found: ${ROTATION_STATE_FILE}"
-    exit 1
-  fi
-
-  local new_key
-  new_key=$(jq -r '.new_key' "$ROTATION_STATE_FILE")
-
-  if [[ -z "$new_key" || "$new_key" == "null" ]]; then
-    log_error "New API key not found in rotation state file."
+  if [[ -z "$new_key" ]]; then
+    log_error "NEW_DD_API_KEY is not set. Check that generate_matrix.sh ran correctly."
     exit 1
   fi
 
