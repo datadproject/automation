@@ -54,7 +54,20 @@ generate_child_pipeline() {
   local new_api_key
   if [[ -f "$rotation_state" ]]; then
     new_api_key=$(jq -r '.new_key' "$rotation_state")
-    log_info "Read new API key from rotation_state.json (last4: ${new_api_key: -4})"
+    log_info "Read new API key from rotation_state.json (length: ${#new_api_key}, last4: ${new_api_key: -4})"
+
+    # Safety: ensure we got an actual key value, not a variable reference or empty
+    if [[ -z "$new_api_key" || "$new_api_key" == "null" ]]; then
+      log_error "new_key in rotation_state.json is empty or null!"
+      jq '.' "$rotation_state"
+      exit 1
+    fi
+    if [[ "$new_api_key" == *"GITLAB"* || "$new_api_key" == *"TOKEN"* || "$new_api_key" == *'$'* || "$new_api_key" == *"{"* ]]; then
+      log_error "new_key contains a variable reference instead of the actual key value!"
+      log_error "Value: ${new_api_key}"
+      log_error "This means rotate_key.sh or prepare-rollout-only wrote a literal variable name."
+      exit 1
+    fi
   else
     log_error "rotation_state.json not found — cannot generate child pipeline"
     exit 1
