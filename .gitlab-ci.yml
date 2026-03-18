@@ -24,7 +24,7 @@ variables:
   GIT_STRATEGY: clone
   GIT_SSL_NO_VERIFY: "true"
   DD_API_KEY_VAR_NAME: GITLAB_DATADOG_API_TOKEN
-  CONFIG_FILE: config/clusters.yml
+  CONFIG_FILE: config/clusters.json
   VERIFY_TIMEOUT: "600"
   ROLLOUT_TIMEOUT: "300s"
   # ---------------------------------------------------------------------------
@@ -43,6 +43,9 @@ variables:
   #   - Onboarding new clusters that need the current key
   #   - Testing the rollout on a canary cluster before full rotation
   ROLLOUT_ONLY: "false"
+  # Set to "true" to test connectivity and logic without creating keys
+  # or modifying anything. Validates: proxy, DD API auth, GitLab API auth.
+  DRY_RUN: "false"
 
 # ---------------------------------------------------------------------------
 # Shell executor — tools (aws, kubectl, jq, yq) are pre-installed on runner
