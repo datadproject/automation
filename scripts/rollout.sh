@@ -134,33 +134,18 @@ update_operator_secret() {
 # ------------------------------------------------------------------------------
 # Restart Datadog agent pods to pick up the new key.
 #
-# Strategy:
-#   - If Datadog Operator is present, restart only the operator. The operator
-#     watches the secret and will reconcile the agent DaemonSet + cluster agent
-#     automatically. We just wait for the operator pod to be ready.
-#   - If NO operator (helm-only), manually restart the DaemonSet + cluster agent.
+# Always explicitly restart the agent DaemonSet and cluster agent deployment.
+# The operator does NOT auto-reconcile when the K8s secret changes, so we
+# must trigger restarts ourselves.
 # ------------------------------------------------------------------------------
 restart_datadog_agents() {
   log_info "Triggering rolling restart of Datadog agent resources..."
 
-  local has_operator=false
-
-  # Check for Datadog Operator
-  if kubectl get deployment datadog-operator -n "$K8S_NAMESPACE" &>/dev/null; then
-    has_operator=true
-    log_info "Detected Datadog Operator. Restarting operator (it will reconcile agents)..."
-    kubectl rollout restart deployment/datadog-operator -n "$K8S_NAMESPACE"
-    kubectl rollout status deployment/datadog-operator -n "$K8S_NAMESPACE" --timeout="$ROLLOUT_TIMEOUT"
-    log_info "Operator restarted. Waiting 30s for operator to begin agent reconciliation..."
-    sleep 30
-  fi
-
-  # Find the agent DaemonSet
+  # 1. Restart agent DaemonSet
   local agent_ds
   agent_ds=$(kubectl get daemonset -n "$K8S_NAMESPACE" -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 
   if [[ -z "$agent_ds" ]]; then
-    # Fallback: try common names
     for ds_name in datadog-agent datadogagent datadog; do
       if kubectl get daemonset "$ds_name" -n "$K8S_NAMESPACE" &>/dev/null; then
         agent_ds="$ds_name"
@@ -170,40 +155,37 @@ restart_datadog_agents() {
   fi
 
   if [[ -n "$agent_ds" ]]; then
-    if $has_operator; then
-      # Operator manages agents — just wait for rollout to finish (operator triggers it)
-      log_info "Waiting for DaemonSet ${agent_ds} rollout (operator-managed)..."
-      kubectl rollout status daemonset/"$agent_ds" -n "$K8S_NAMESPACE" --timeout="$ROLLOUT_TIMEOUT" || {
-        log_warn "DaemonSet rollout timed out. Checking pod status..."
-        kubectl get pods -n "$K8S_NAMESPACE" -l app.kubernetes.io/component=agent --no-headers | head -10
-        log_warn "Pods may still be rolling out. Continuing to health check."
-      }
-    else
-      # No operator — manually restart
-      log_info "No operator detected. Manually restarting DaemonSet: ${agent_ds}"
-      kubectl rollout restart daemonset/"$agent_ds" -n "$K8S_NAMESPACE"
-      kubectl rollout status daemonset/"$agent_ds" -n "$K8S_NAMESPACE" --timeout="$ROLLOUT_TIMEOUT" || {
-        log_warn "DaemonSet rollout timed out. Checking pod status..."
-        kubectl get pods -n "$K8S_NAMESPACE" -l app.kubernetes.io/component=agent --no-headers | head -10
-        log_warn "Pods may still be rolling out. Continuing to health check."
-      }
-    fi
+    log_info "Restarting DaemonSet: ${agent_ds}"
+    kubectl rollout restart daemonset/"$agent_ds" -n "$K8S_NAMESPACE"
+    kubectl rollout status daemonset/"$agent_ds" -n "$K8S_NAMESPACE" --timeout="$ROLLOUT_TIMEOUT" || {
+      log_warn "DaemonSet rollout timed out. Checking pod status..."
+      kubectl get pods -n "$K8S_NAMESPACE" -l app.kubernetes.io/component=agent --no-headers | head -10
+      log_warn "Pods may still be rolling out. Continuing to health check."
+    }
   else
     log_warn "No Datadog agent DaemonSet found in namespace ${K8S_NAMESPACE}"
   fi
 
-  # Cluster agent — only manually restart if no operator
-  if ! $has_operator; then
-    local cluster_agent_deploy
-    cluster_agent_deploy=$(kubectl get deployment -n "$K8S_NAMESPACE" -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+  # 2. Restart cluster agent deployment
+  local cluster_agent_deploy
+  cluster_agent_deploy=$(kubectl get deployment -n "$K8S_NAMESPACE" -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 
-    if [[ -n "$cluster_agent_deploy" ]]; then
-      log_info "Restarting Cluster Agent deployment: ${cluster_agent_deploy}"
-      kubectl rollout restart deployment/"$cluster_agent_deploy" -n "$K8S_NAMESPACE"
-      kubectl rollout status deployment/"$cluster_agent_deploy" -n "$K8S_NAMESPACE" --timeout="$ROLLOUT_TIMEOUT" || {
-        log_warn "Cluster agent rollout timed out. Continuing to health check."
-      }
-    fi
+  if [[ -z "$cluster_agent_deploy" ]]; then
+    # Fallback: try common names
+    for dep_name in datadog-cluster-agent datadogagent-cluster-agent; do
+      if kubectl get deployment "$dep_name" -n "$K8S_NAMESPACE" &>/dev/null; then
+        cluster_agent_deploy="$dep_name"
+        break
+      fi
+    done
+  fi
+
+  if [[ -n "$cluster_agent_deploy" ]]; then
+    log_info "Restarting Cluster Agent: ${cluster_agent_deploy}"
+    kubectl rollout restart deployment/"$cluster_agent_deploy" -n "$K8S_NAMESPACE"
+    kubectl rollout status deployment/"$cluster_agent_deploy" -n "$K8S_NAMESPACE" --timeout="$ROLLOUT_TIMEOUT" || {
+      log_warn "Cluster agent rollout timed out. Continuing to health check."
+    }
   fi
 
   log_info "Agent restart phase complete."
