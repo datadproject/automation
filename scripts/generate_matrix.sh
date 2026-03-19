@@ -95,7 +95,7 @@ generate_child_pipeline() {
     echo "  retry:"
     echo "    max: 2"
     echo "    when: script_failure"
-    echo "  timeout: 10m"
+    echo "  timeout: 15m"
     echo ""
   } > "$output"
 
