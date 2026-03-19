@@ -47,9 +47,10 @@ check_cluster_reporting() {
 
   # Query Datadog for hosts with a matching cluster name tag
   # The agent reports kube_cluster_name as a host tag
+  # Look back 15 minutes — agents need time to restart and report in
   local response
   response=$(curl -sf -X GET \
-    "${DD_API_BASE}/api/v1/hosts?filter=kube_cluster_name:${cluster_name}&count=1&from=$(( $(date +%s) - 300 ))" \
+    "${DD_API_BASE}/api/v1/hosts?filter=kube_cluster_name:${cluster_name}&count=1&from=$(( $(date +%s) - 900 ))" \
     -H "DD-API-KEY: ${new_key}" \
     -H "DD-APPLICATION-KEY: ${DD_APP_KEY}" 2>/dev/null || echo '{"total_matching": 0}')
 
@@ -69,8 +70,6 @@ check_cluster_reporting() {
 main() {
   log_info "========== Stage 3: Verify Cluster Reporting =========="
 
-  setup_proxy
-
   if [[ ! -f "$ROTATION_STATE_FILE" ]]; then
     log_error "Rotation state file not found: ${ROTATION_STATE_FILE}"
     exit 1
@@ -84,6 +83,8 @@ main() {
   local total_clusters=${#expected_clusters[@]}
 
   log_info "Expecting ${total_clusters} clusters to report."
+  log_info "Waiting 60s for agents to restart and begin reporting..."
+  sleep 60
 
   local start_time
   start_time=$(date +%s)
