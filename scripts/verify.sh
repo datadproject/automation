@@ -27,6 +27,10 @@ CONFIG_FILE="${CONFIG_FILE:-config/clusters.json}"
 
 # Minimum percentage of clusters that must be reporting to pass verification
 VERIFY_THRESHOLD="${VERIFY_THRESHOLD:-80}"
+# How many times to check before giving up (default: 5 = ~2.5 min with 30s interval)
+VERIFY_MAX_RETRIES="${VERIFY_MAX_RETRIES:-5}"
+# How long to wait between checks (default: 30 seconds)
+VERIFY_INTERVAL="${VERIFY_INTERVAL:-30}"
 
 # ------------------------------------------------------------------------------
 # Get list of expected cluster names from inventory (respects CLUSTER_FILTER)
@@ -83,25 +87,55 @@ main() {
   local total_clusters=${#expected_clusters[@]}
 
   log_info "Checking ${total_clusters} cluster(s) against Datadog API (threshold: ${VERIFY_THRESHOLD}%)"
+  log_info "Will retry up to ${VERIFY_MAX_RETRIES} times with ${VERIFY_INTERVAL}s between attempts..."
 
   local reporting=0
   local not_reporting=()
+  local pct=0
+  local attempt=0
 
-  for cluster in "${expected_clusters[@]}"; do
-    if check_cluster_reporting "$new_key" "$cluster"; then
-      (( reporting++ ))
-      log_info "  ✓ ${cluster}"
-    else
-      not_reporting+=("$cluster")
-      log_warn "  ✗ ${cluster}"
+  while (( attempt < VERIFY_MAX_RETRIES )); do
+    (( attempt++ ))
+    reporting=0
+    not_reporting=()
+
+    for cluster in "${expected_clusters[@]}"; do
+      if check_cluster_reporting "$new_key" "$cluster"; then
+        (( reporting++ ))
+      else
+        not_reporting+=("$cluster")
+      fi
+    done
+
+    if (( total_clusters > 0 )); then
+      pct=$(( (reporting * 100) / total_clusters ))
+    fi
+
+    log_info "Attempt ${attempt}/${VERIFY_MAX_RETRIES}: ${reporting}/${total_clusters} reporting (${pct}%)"
+
+    # Pass if we hit threshold
+    if (( pct >= VERIFY_THRESHOLD )); then
+      break
+    fi
+
+    # Don't sleep after the last attempt
+    if (( attempt < VERIFY_MAX_RETRIES )); then
+      if [[ ${#not_reporting[@]} -gt 0 ]]; then
+        log_info "Not yet reporting: ${not_reporting[*]}"
+      fi
+      log_info "Waiting ${VERIFY_INTERVAL}s before next check..."
+      sleep "$VERIFY_INTERVAL"
     fi
   done
 
-  # Calculate percentage
-  local pct=0
-  if (( total_clusters > 0 )); then
-    pct=$(( (reporting * 100) / total_clusters ))
-  fi
+  # Log final per-cluster status
+  for cluster in "${expected_clusters[@]}"; do
+    if check_cluster_reporting "$new_key" "$cluster"; then
+      log_info "  OK ${cluster}"
+    else
+      log_warn "  FAIL ${cluster}"
+    fi
+  done
 
   log_info "Result: ${reporting}/${total_clusters} clusters reporting (${pct}%)"
 
