@@ -165,7 +165,10 @@ rollout-clusters:
     - if: '$FORCE_ROTATION == "true"'
 
 # ===========================================================================
-# Stage 4: Verify — Confirm all clusters are reporting
+# Stage 4: Verify — Confirm clusters are reporting (threshold-based)
+# Single pass, no polling loop. Passes if >= VERIFY_THRESHOLD% of clusters
+# are reporting (default 80%). This prevents 1 slow cluster from blocking
+# the entire rotation while still catching widespread failures.
 # ===========================================================================
 verify-clusters:
   extends: .default-auth
