@@ -23,7 +23,6 @@ ROTATION_STATE_FILE="${ROTATION_STATE_FILE:-${CI_PROJECT_DIR:-$(pwd)}/rotation_s
 main() {
   log_info "========== Stage 4: Revoke Old API Key =========="
 
-  setup_proxy
 
   if [[ ! -f "$ROTATION_STATE_FILE" ]]; then
     log_error "Rotation state file not found: ${ROTATION_STATE_FILE}"
