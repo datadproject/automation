@@ -132,13 +132,6 @@ generate-rollout-matrix:
       - rotation_state.json
       - cluster_matrix.txt
     expire_in: 1 day
-  needs:
-    - job: rotate-api-key
-      artifacts: true
-      optional: true
-    - job: prepare-rollout-only
-      artifacts: true
-      optional: true
   rules:
     - if: '$ROLLOUT_ONLY == "true"'
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
