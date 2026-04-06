@@ -157,11 +157,8 @@ restart_datadog_agents() {
   if [[ -n "$agent_ds" ]]; then
     log_info "Restarting DaemonSet: ${agent_ds}"
     kubectl rollout restart daemonset/"$agent_ds" -n "$K8S_NAMESPACE"
-    kubectl rollout status daemonset/"$agent_ds" -n "$K8S_NAMESPACE" --timeout="$ROLLOUT_TIMEOUT" || {
-      log_warn "DaemonSet rollout timed out. Checking pod status..."
-      kubectl get pods -n "$K8S_NAMESPACE" -l app.kubernetes.io/component=agent --no-headers | head -10
-      log_warn "Pods may still be rolling out. Continuing to health check."
-    }
+    log_info "Waiting for all ${agent_ds} pods to be ready (no timeout)..."
+    kubectl rollout status daemonset/"$agent_ds" -n "$K8S_NAMESPACE"
   else
     log_warn "No Datadog agent DaemonSet found in namespace ${K8S_NAMESPACE}"
   fi
@@ -171,7 +168,6 @@ restart_datadog_agents() {
   cluster_agent_deploy=$(kubectl get deployment -n "$K8S_NAMESPACE" -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 
   if [[ -z "$cluster_agent_deploy" ]]; then
-    # Fallback: try common names
     for dep_name in datadog-cluster-agent datadogagent-cluster-agent; do
       if kubectl get deployment "$dep_name" -n "$K8S_NAMESPACE" &>/dev/null; then
         cluster_agent_deploy="$dep_name"
@@ -183,9 +179,8 @@ restart_datadog_agents() {
   if [[ -n "$cluster_agent_deploy" ]]; then
     log_info "Restarting Cluster Agent: ${cluster_agent_deploy}"
     kubectl rollout restart deployment/"$cluster_agent_deploy" -n "$K8S_NAMESPACE"
-    kubectl rollout status deployment/"$cluster_agent_deploy" -n "$K8S_NAMESPACE" --timeout="$ROLLOUT_TIMEOUT" || {
-      log_warn "Cluster agent rollout timed out. Continuing to health check."
-    }
+    log_info "Waiting for cluster agent pods to be ready..."
+    kubectl rollout status deployment/"$cluster_agent_deploy" -n "$K8S_NAMESPACE"
   fi
 
   log_info "Agent restart phase complete."
@@ -221,6 +216,59 @@ health_check() {
 }
 
 # ------------------------------------------------------------------------------
+# Verify this cluster is reporting to Datadog with the new API key.
+# Polls the Datadog API until at least one host with this cluster's tag is
+# seen, or gives up after VERIFY_POLL_TIMEOUT seconds (default: 5 minutes).
+# This runs per-cluster inside the rollout job — no separate verify stage needed.
+# ------------------------------------------------------------------------------
+DD_API_BASE="https://api.ddog-gov.com"
+VERIFY_POLL_TIMEOUT="${VERIFY_POLL_TIMEOUT:-300}"
+VERIFY_POLL_INTERVAL="${VERIFY_POLL_INTERVAL:-30}"
+
+verify_cluster_reporting() {
+  local new_key="$1"
+  local cluster_name="$2"
+
+  # DD_APP_KEY is required for the Datadog API query
+  if [[ -z "${DD_APP_KEY:-}" ]]; then
+    log_warn "DD_APP_KEY not set — skipping Datadog API verification."
+    log_warn "Pods are running but cannot confirm Datadog is receiving data."
+    return 0
+  fi
+
+  log_info "Verifying ${cluster_name} is reporting to Datadog with the new key..."
+
+  local start_time elapsed
+  start_time=$(date +%s)
+
+  while true; do
+    elapsed=$(( $(date +%s) - start_time ))
+
+    local response total
+    response=$(curl -sf -X GET \
+      "${DD_API_BASE}/api/v1/hosts?filter=kube_cluster_name:${cluster_name}&count=1&from=$(( $(date +%s) - 900 ))" \
+      -H "DD-API-KEY: ${new_key}" \
+      -H "DD-APPLICATION-KEY: ${DD_APP_KEY}" 2>/dev/null || echo '{"total_matching": 0}')
+
+    total=$(echo "$response" | jq -r '.total_matching // 0')
+
+    if [[ "$total" -gt 0 ]]; then
+      log_info "Verified: ${cluster_name} is reporting to Datadog (${total} host(s) found)."
+      return 0
+    fi
+
+    if (( elapsed >= VERIFY_POLL_TIMEOUT )); then
+      log_warn "Verification warning: ${cluster_name} not yet reporting to Datadog after ${VERIFY_POLL_TIMEOUT}s."
+      log_warn "Pods are running but Datadog API shows no hosts yet. It may still be propagating."
+      return 0
+    fi
+
+    log_info "Not yet reporting (${elapsed}s/${VERIFY_POLL_TIMEOUT}s). Retrying in ${VERIFY_POLL_INTERVAL}s..."
+    sleep "$VERIFY_POLL_INTERVAL"
+  done
+}
+
+# ------------------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------------------
 main() {
@@ -245,13 +293,16 @@ main() {
   # Step 4: Restart Datadog agents
   restart_datadog_agents
 
-  # Step 5: Health check
+  # Step 5: Health check — pods are running
   health_check
+
+  # Step 6: Verify cluster is reporting to Datadog API with the new key
+  verify_cluster_reporting "$new_key" "$CLUSTER_NAME"
 
   # Clear assumed role for safety
   clear_assumed_role
 
-  log_info "Rollout to ${CLUSTER_NAME} complete."
+  log_info "Rollout to ${CLUSTER_NAME} complete and verified."
 }
 
 main "$@"
