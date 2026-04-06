@@ -92,10 +92,8 @@ generate_child_pipeline() {
     echo "    - source scripts/helpers.sh"
     echo "  script:"
     echo "    - bash scripts/rollout.sh"
-    echo "  retry:"
-    echo "    max: 2"
-    echo "    when: script_failure"
     echo "  timeout: 15m"
+    echo "  allow_failure: true"
     echo ""
   } > "$output"
 
