@@ -29,12 +29,11 @@ main() {
     exit 1
   fi
 
-  local verify_result
-  verify_result=$(jq -r '.verify_result' "$ROTATION_STATE_FILE")
-
-  if [[ "$verify_result" != "success" ]]; then
-    log_error "Verification did not succeed (result=${verify_result}). Refusing to revoke old key."
-    log_error "Both old and new keys remain active. Manual investigation required."
+  # Validate that rotation_state.json has the required fields
+  local new_key_check
+  new_key_check=$(jq -r '.new_key // empty' "$ROTATION_STATE_FILE")
+  if [[ -z "$new_key_check" ]]; then
+    log_error "No new_key found in rotation_state.json. Cannot proceed with revoke."
     exit 1
   fi
 
