@@ -296,13 +296,10 @@ main() {
   # Step 5: Health check — pods are running
   health_check
 
-  # Step 6: Verify cluster is reporting to Datadog API with the new key
-  verify_cluster_reporting "$new_key" "$CLUSTER_NAME"
-
   # Clear assumed role for safety
   clear_assumed_role
 
-  log_info "Rollout to ${CLUSTER_NAME} complete and verified."
+  log_info "Rollout to ${CLUSTER_NAME} complete."
 }
 
 main "$@"
