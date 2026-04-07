@@ -16,7 +16,7 @@
 #   DD_APP_KEY          — Datadog Application key
 #   ROTATION_STATE_FILE — Path to rotation state JSON from stage 1
 # ==============================================================================
-set -euo pipefail
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/helpers.sh"
@@ -24,6 +24,12 @@ source "${SCRIPT_DIR}/helpers.sh"
 DD_API_BASE="https://api.ddog-gov.com"
 ROTATION_STATE_FILE="${ROTATION_STATE_FILE:-${CI_PROJECT_DIR:-$(pwd)}/rotation_state.json}"
 CONFIG_FILE="${CONFIG_FILE:-config/clusters.json}"
+
+# Pre-flight: DD_APP_KEY is required for Datadog API queries
+if [[ -z "${DD_APP_KEY:-}" ]]; then
+  log_error "DD_APP_KEY is not set. Cannot verify cluster reporting."
+  exit 1
+fi
 
 # Minimum percentage of clusters that must be reporting to pass verification
 VERIFY_THRESHOLD="${VERIFY_THRESHOLD:-80}"
