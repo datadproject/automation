@@ -1,0 +1,314 @@
+---
+# =============================================================================
+# Rotate Datadog API Key
+# =============================================================================
+#
+# Updates the Datadog Agent's api_key on existing managed hosts (Linux + Windows)
+# by pulling the current key value from AWS Secrets Manager. Does NOT install
+# the agent; hosts without datadog-agent installed are skipped (not failed).
+#
+# Targeting (use Ansible's :& intersection operator with --limit):
+#   --limit 'env_Production:&os_linux'
+#   --limit 'env_Production:&os_windows'
+#   --limit 'account_236024529161:&env_Production'
+#
+# Secret format in AWS Secrets Manager (either is supported):
+#   1. Plain string:  the secret value IS the API key
+#   2. JSON object:   {"api_key": "abc123...", "app_key": "..."}
+#      -- set datadog_secret_json_key=api_key to extract that field
+#
+# Required vars (override at pipeline run-time):
+#   datadog_secret_name        Name/ARN of the secret in AWS Secrets Manager
+#   aws_region                 AWS region the secret lives in (default: us-gov-west-1)
+#
+# Optional vars:
+#   datadog_secret_json_key    JSON field to extract (default: unset = plain string)
+#   dry_run                    true = check_mode + diff, false = apply (default: false)
+#   datadog_restart_agent      true to restart agent after key change (default: true)
+#
+# Safety:
+#   * The API key is never logged (no_log on every task that touches it).
+#   * datadog.yaml is backed up before modification; on failure we restore.
+#   * Service is verified running after restart; rescue rolls back.
+#   * The secret is fetched ONCE on the runner (delegate_to: localhost) and
+#     pushed to hosts in-memory -- target hosts never call AWS APIs.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Play 1: Fetch the API key once on the runner (no host targeting yet)
+# -----------------------------------------------------------------------------
+- name: "Fetch Datadog API key from AWS Secrets Manager"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tags: [always]
+
+  vars:
+    aws_region: "{{ aws_region | default('us-gov-west-1') }}"
+
+  tasks:
+    - name: "Validate required variables are set"
+      ansible.builtin.assert:
+        that:
+          - datadog_secret_name is defined
+          - datadog_secret_name | length > 0
+        fail_msg: >-
+          datadog_secret_name must be provided. Pass it as a pipeline variable
+          (e.g. datadog_secret_name=datadog/prod/api_key).
+
+    - name: "Retrieve secret from AWS Secrets Manager"
+      ansible.builtin.set_fact:
+        _datadog_secret_raw: "{{ lookup('amazon.aws.aws_secret', datadog_secret_name, region=aws_region) }}"
+      no_log: true
+
+    - name: "Extract api_key from secret payload"
+      ansible.builtin.set_fact:
+        datadog_api_key: >-
+          {{
+            (_datadog_secret_raw | from_json)[datadog_secret_json_key]
+            if (datadog_secret_json_key is defined and datadog_secret_json_key | length > 0)
+            else _datadog_secret_raw
+          }}
+      no_log: true
+
+    - name: "Sanity-check the retrieved key"
+      ansible.builtin.assert:
+        that:
+          - datadog_api_key is defined
+          - datadog_api_key | length >= 32   # DD API keys are 32 hex chars
+          - datadog_api_key is match('^[A-Fa-f0-9]+$')
+        fail_msg: >-
+          The value retrieved from Secrets Manager does not look like a Datadog
+          API key (expected 32+ hex chars). Check the secret name and json key.
+        success_msg: "Datadog API key retrieved successfully (length OK)."
+      no_log: true
+
+    - name: "Show what will happen"
+      ansible.builtin.debug:
+        msg:
+          - "Secret source : {{ datadog_secret_name }} (region: {{ aws_region }})"
+          - "Dry run       : {{ dry_run | default(false) }}"
+          - "Restart agent : {{ datadog_restart_agent | default(true) }}"
+
+
+# -----------------------------------------------------------------------------
+# Play 2: Linux hosts -- update /etc/datadog-agent/datadog.yaml
+# -----------------------------------------------------------------------------
+- name: "Rotate Datadog API key on Linux hosts"
+  hosts: os_linux
+  gather_facts: true
+  become: true
+  check_mode: "{{ dry_run | default(false) | bool }}"
+  diff: "{{ dry_run | default(false) | bool }}"
+
+  vars:
+    datadog_api_key: "{{ hostvars['localhost']['datadog_api_key'] }}"
+    dd_config_path: /etc/datadog-agent/datadog.yaml
+    dd_service_name: datadog-agent
+    dd_backup_path: "/etc/datadog-agent/datadog.yaml.bak.{{ ansible_date_time.epoch | default(lookup('pipe','date +%s')) }}"
+
+  tasks:
+    - name: "Skip hosts without Datadog Agent installed"
+      block:
+        - name: "Check whether datadog.yaml exists"
+          ansible.builtin.stat:
+            path: "{{ dd_config_path }}"
+          register: _dd_config_stat
+
+        - name: "Mark host as skipped when agent is absent"
+          ansible.builtin.meta: end_host
+          when: not _dd_config_stat.stat.exists
+
+    - name: "Rotate API key with rollback safety"
+      block:
+        - name: "Back up current datadog.yaml"
+          ansible.builtin.copy:
+            src: "{{ dd_config_path }}"
+            dest: "{{ dd_backup_path }}"
+            remote_src: true
+            owner: dd-agent
+            group: dd-agent
+            mode: "0640"
+
+        - name: "Update api_key line in datadog.yaml"
+          ansible.builtin.lineinfile:
+            path: "{{ dd_config_path }}"
+            regexp: '^\s*#?\s*api_key:.*$'
+            line: "api_key: {{ datadog_api_key }}"
+            owner: dd-agent
+            group: dd-agent
+            mode: "0640"
+            backup: false   # we already took a timestamped backup
+          no_log: true
+          register: _dd_keyline
+
+        - name: "Restart datadog-agent service"
+          ansible.builtin.systemd:
+            name: "{{ dd_service_name }}"
+            state: restarted
+            enabled: true
+            daemon_reload: false
+          when:
+            - datadog_restart_agent | default(true) | bool
+            - _dd_keyline.changed
+            - not ansible_check_mode
+
+        - name: "Wait for agent to report healthy"
+          ansible.builtin.command: "datadog-agent status --json"
+          register: _dd_status
+          changed_when: false
+          failed_when: false
+          retries: 6
+          delay: 10
+          until: _dd_status.rc == 0
+          when:
+            - datadog_restart_agent | default(true) | bool
+            - not ansible_check_mode
+          no_log: true
+
+        - name: "Confirm service is active"
+          ansible.builtin.systemd:
+            name: "{{ dd_service_name }}"
+          register: _dd_svc
+          when: not ansible_check_mode
+
+        - name: "Fail if service is not running"
+          ansible.builtin.fail:
+            msg: "datadog-agent did not return to active state after key rotation."
+          when:
+            - not ansible_check_mode
+            - _dd_svc.status.ActiveState is defined
+            - _dd_svc.status.ActiveState != 'active'
+
+      rescue:
+        - name: "ROLLBACK -- restore previous datadog.yaml"
+          ansible.builtin.copy:
+            src: "{{ dd_backup_path }}"
+            dest: "{{ dd_config_path }}"
+            remote_src: true
+            owner: dd-agent
+            group: dd-agent
+            mode: "0640"
+
+        - name: "ROLLBACK -- restart datadog-agent on previous config"
+          ansible.builtin.systemd:
+            name: "{{ dd_service_name }}"
+            state: restarted
+          failed_when: false
+
+        - name: "Fail loudly so the result file flags this host"
+          ansible.builtin.fail:
+            msg: >-
+              API key rotation FAILED on {{ inventory_hostname }}. Previous
+              datadog.yaml was restored from {{ dd_backup_path }}.
+
+      always:
+        - name: "Record outcome"
+          ansible.builtin.debug:
+            msg: "Key rotation complete on {{ inventory_hostname }} (backup at {{ dd_backup_path }})"
+
+
+# -----------------------------------------------------------------------------
+# Play 3: Windows hosts -- update C:\ProgramData\Datadog\datadog.yaml
+# -----------------------------------------------------------------------------
+- name: "Rotate Datadog API key on Windows hosts"
+  hosts: os_windows
+  gather_facts: true
+  check_mode: "{{ dry_run | default(false) | bool }}"
+  diff: "{{ dry_run | default(false) | bool }}"
+
+  vars:
+    datadog_api_key: "{{ hostvars['localhost']['datadog_api_key'] }}"
+    dd_config_path: 'C:\ProgramData\Datadog\datadog.yaml'
+    dd_service_name: datadogagent
+    dd_backup_path: 'C:\ProgramData\Datadog\datadog.yaml.bak.{{ ansible_date_time.epoch | default(lookup("pipe","date +%s")) }}'
+
+  tasks:
+    - name: "Skip hosts without Datadog Agent installed"
+      block:
+        - name: "Check whether datadog.yaml exists"
+          ansible.windows.win_stat:
+            path: "{{ dd_config_path }}"
+          register: _dd_config_stat
+
+        - name: "Mark host as skipped when agent is absent"
+          ansible.builtin.meta: end_host
+          when: not _dd_config_stat.stat.exists
+
+    - name: "Rotate API key with rollback safety"
+      block:
+        - name: "Back up current datadog.yaml"
+          ansible.windows.win_copy:
+            src: "{{ dd_config_path }}"
+            dest: "{{ dd_backup_path }}"
+            remote_src: true
+
+        - name: "Update api_key line in datadog.yaml"
+          community.windows.win_lineinfile:
+            path: "{{ dd_config_path }}"
+            regexp: '^\s*#?\s*api_key:.*$'
+            line: "api_key: {{ datadog_api_key }}"
+          no_log: true
+          register: _dd_keyline
+
+        - name: "Restart datadogagent service"
+          ansible.windows.win_service:
+            name: "{{ dd_service_name }}"
+            state: restarted
+            start_mode: auto
+          when:
+            - datadog_restart_agent | default(true) | bool
+            - _dd_keyline.changed
+            - not ansible_check_mode
+
+        - name: "Wait for agent to report healthy"
+          ansible.windows.win_command: '"C:\Program Files\Datadog\Datadog Agent\bin\agent.exe" status'
+          register: _dd_status
+          changed_when: false
+          failed_when: false
+          retries: 6
+          delay: 10
+          until: _dd_status.rc == 0
+          when:
+            - datadog_restart_agent | default(true) | bool
+            - not ansible_check_mode
+          no_log: true
+
+        - name: "Confirm service is running"
+          ansible.windows.win_service_info:
+            name: "{{ dd_service_name }}"
+          register: _dd_svc
+          when: not ansible_check_mode
+
+        - name: "Fail if service is not running"
+          ansible.builtin.fail:
+            msg: "datadogagent did not return to running state after key rotation."
+          when:
+            - not ansible_check_mode
+            - _dd_svc.services is defined
+            - _dd_svc.services | length > 0
+            - _dd_svc.services[0].state != 'running'
+
+      rescue:
+        - name: "ROLLBACK -- restore previous datadog.yaml"
+          ansible.windows.win_copy:
+            src: "{{ dd_backup_path }}"
+            dest: "{{ dd_config_path }}"
+            remote_src: true
+
+        - name: "ROLLBACK -- restart datadogagent on previous config"
+          ansible.windows.win_service:
+            name: "{{ dd_service_name }}"
+            state: restarted
+          failed_when: false
+
+        - name: "Fail loudly so the result file flags this host"
+          ansible.builtin.fail:
+            msg: >-
+              API key rotation FAILED on {{ inventory_hostname }}. Previous
+              datadog.yaml was restored from {{ dd_backup_path }}.
+
+      always:
+        - name: "Record outcome"
+          ansible.builtin.debug:
+            msg: "Key rotation complete on {{ inventory_hostname }} (backup at {{ dd_backup_path }})"

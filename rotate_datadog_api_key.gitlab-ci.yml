@@ -1,0 +1,59 @@
+# =============================================================================
+# Add this job to .gitlab-ci.yml so it shows up in the CI/CD -> Run Pipeline UI
+# alongside bootstrap_linux_hosts, patch_linux_servers, verify_connectivity, etc.
+#
+# Adjust the `image:`, `before_script:`, and any tags/extends keys to match the
+# patterns already used by the existing jobs (e.g. patch_linux_servers) -- this
+# snippet shows the job-specific bits only.
+# =============================================================================
+
+rotate_datadog_api_key:
+  stage: configure                # or whatever stage your repo uses for config jobs
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'   # manual / Run-Pipeline only -- never auto
+      when: manual
+  variables:
+    # Pipeline-prompted variables. Operators fill these in via the Run Pipeline form.
+    LIMIT_PATTERN:
+      description: "Ansible --limit pattern. e.g. env_Production:&os_linux  OR  env_Production:&os_windows  OR  env_Production"
+      value: ""
+    datadog_secret_name:
+      description: "AWS Secrets Manager secret name or ARN containing the Datadog API key"
+      value: "datadog/prod/api_key"
+    datadog_secret_json_key:
+      description: "If the secret is a JSON object, the field name to extract (leave blank for plain-string secrets)"
+      value: ""
+    aws_region:
+      description: "AWS region the secret lives in"
+      value: "us-gov-west-1"
+    dry_run:
+      description: "true = check_mode only (no changes written), false = apply"
+      value: "true"
+    datadog_restart_agent:
+      description: "Restart the Datadog Agent after updating the key"
+      value: "true"
+  script:
+    - |
+      set -euo pipefail
+      if [ -z "${LIMIT_PATTERN}" ]; then
+        echo "ERROR: LIMIT_PATTERN must be set (e.g. env_Production:&os_linux)" >&2
+        exit 2
+      fi
+      EXTRA_VARS="datadog_secret_name=${datadog_secret_name}"
+      EXTRA_VARS="${EXTRA_VARS} aws_region=${aws_region}"
+      EXTRA_VARS="${EXTRA_VARS} dry_run=${dry_run}"
+      EXTRA_VARS="${EXTRA_VARS} datadog_restart_agent=${datadog_restart_agent}"
+      if [ -n "${datadog_secret_json_key}" ]; then
+        EXTRA_VARS="${EXTRA_VARS} datadog_secret_json_key=${datadog_secret_json_key}"
+      fi
+      ansible-playbook \
+        -i inventories/generated/static_inventory.yml \
+        playbooks/config/rotate_datadog_api_key.yml \
+        --limit "${LIMIT_PATTERN}" \
+        --extra-vars "${EXTRA_VARS}" \
+        2>&1 | tee ansible_output.log
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - ansible_output.log
