@@ -1,0 +1,108 @@
+---
+# =============================================================================
+# Ping Test -- Datadog Rotate Pre-flight Check (connectivity only)
+# =============================================================================
+#
+# Verifies target-host plumbing the real rotate_datadog_api_key.yml playbook
+# uses, WITHOUT touching AWS Secrets Manager and WITHOUT touching any agent
+# config:
+#
+#   1. Linux hosts respond to SSH and can run a command
+#   2. Windows hosts respond to WinRM and can run a command
+#   3. Reports whether datadog-agent is installed where you expect it to be
+#
+# Run this FIRST. If it passes, the real rotate playbook will work for the
+# target-host portion. (The Secrets Manager fetch is exercised by the real
+# rotate playbook itself in dry-run mode.)
+#
+# Usage (via GitLab CI job ping_datadog_rotate):
+#   LIMIT_PATTERN=env_Sandbox:&os_linux
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Play 1: Test Linux connectivity + locate datadog-agent
+# -----------------------------------------------------------------------------
+- name: "PING 1/2 -- Linux hosts: SSH + agent presence"
+  hosts: os_linux
+  gather_facts: true
+  become: true
+
+  vars:
+    dd_config_path: /etc/datadog-agent/datadog.yaml
+    dd_service_name: datadog-agent
+
+  tasks:
+    - name: "Basic ping (SSH + Python on target)"
+      ansible.builtin.ping:
+
+    - name: "Show OS facts so we know what we're hitting"
+      ansible.builtin.debug:
+        msg:
+          - "Host        : {{ inventory_hostname }} ({{ ansible_host | default('?') }})"
+          - "Distro      : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Python      : {{ ansible_python.executable }} ({{ ansible_python.version.major }}.{{ ansible_python.version.minor }})"
+          - "Account     : {{ aws_account_id | default('?') }}"
+          - "Environment : {{ environment | default('?') }}"
+          - "Function    : {{ function | default('?') }}"
+
+    - name: "Look for datadog.yaml"
+      ansible.builtin.stat:
+        path: "{{ dd_config_path }}"
+      register: _dd_config_stat
+
+    - name: "Look for datadog-agent service"
+      ansible.builtin.systemd:
+        name: "{{ dd_service_name }}"
+      register: _dd_svc
+      failed_when: false
+      changed_when: false
+
+    - name: "Report Datadog Agent status (without making changes)"
+      ansible.builtin.debug:
+        msg:
+          - "datadog.yaml present : {{ _dd_config_stat.stat.exists }}"
+          - "agent service status : {{ _dd_svc.status.ActiveState | default('not-installed') }}"
+          - "rotate would         : {{ 'UPDATE this host' if _dd_config_stat.stat.exists else 'SKIP this host (no agent)' }}"
+
+
+# -----------------------------------------------------------------------------
+# Play 2: Test Windows connectivity + locate datadogagent
+# -----------------------------------------------------------------------------
+- name: "PING 2/2 -- Windows hosts: WinRM + agent presence"
+  hosts: os_windows
+  gather_facts: true
+
+  vars:
+    dd_config_path: 'C:\ProgramData\Datadog\datadog.yaml'
+    dd_service_name: datadogagent
+
+  tasks:
+    - name: "Basic ping (WinRM)"
+      ansible.windows.win_ping:
+
+    - name: "Show OS facts so we know what we're hitting"
+      ansible.builtin.debug:
+        msg:
+          - "Host        : {{ inventory_hostname }} ({{ ansible_host | default('?') }})"
+          - "OS          : {{ ansible_os_name | default(ansible_distribution) }} ({{ ansible_kernel | default('?') }})"
+          - "Account     : {{ aws_account_id | default('?') }}"
+          - "Environment : {{ environment | default('?') }}"
+          - "Function    : {{ function | default('?') }}"
+
+    - name: "Look for datadog.yaml"
+      ansible.windows.win_stat:
+        path: "{{ dd_config_path }}"
+      register: _dd_config_stat
+
+    - name: "Look for datadogagent service"
+      ansible.windows.win_service_info:
+        name: "{{ dd_service_name }}"
+      register: _dd_svc
+      failed_when: false
+
+    - name: "Report Datadog Agent status (without making changes)"
+      ansible.builtin.debug:
+        msg:
+          - "datadog.yaml present : {{ _dd_config_stat.stat.exists }}"
+          - "agent service state  : {{ (_dd_svc.services[0].state if (_dd_svc.services is defined and _dd_svc.services | length > 0) else 'not-installed') }}"
+          - "rotate would         : {{ 'UPDATE this host' if _dd_config_stat.stat.exists else 'SKIP this host (no agent)' }}"

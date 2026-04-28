@@ -1,0 +1,36 @@
+# =============================================================================
+# Add this job to .gitlab-ci.yml alongside the rotate_datadog_api_key job.
+#
+# Adjust `stage:`, `image:`, `extends:`, `tags:`, and any `before_script:` to
+# match the patterns already used by existing jobs (e.g. bootstrap_linux_hosts,
+# patch_linux_servers). This snippet shows the job-specific bits only.
+#
+# This job tests target-host connectivity ONLY (no AWS Secrets Manager call).
+# =============================================================================
+
+ping_datadog_rotate:
+  stage: configure                # match whichever stage your config jobs use
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'   # manual / Run-Pipeline only -- never auto
+      when: manual
+  variables:
+    LIMIT_PATTERN:
+      description: "Ansible --limit pattern. e.g. env_Sandbox:&os_linux  OR  env_Production  OR  account_236024529161:&os_windows"
+      value: ""
+  script:
+    - |
+      set -euo pipefail
+      if [ -z "${LIMIT_PATTERN}" ]; then
+        echo "ERROR: LIMIT_PATTERN must be set (e.g. env_Sandbox:&os_linux)" >&2
+        exit 2
+      fi
+      ansible-playbook \
+        -i inventories/generated/static_inventory.yml \
+        playbooks/config/ping_datadog_rotate.yml \
+        --limit "${LIMIT_PATTERN}" \
+        2>&1 | tee ansible_output.log
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - ansible_output.log
