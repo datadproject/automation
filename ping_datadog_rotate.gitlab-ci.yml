@@ -1,36 +1,105 @@
-# =============================================================================
-# Add this job to .gitlab-ci.yml alongside the rotate_datadog_api_key job.
-#
-# Adjust `stage:`, `image:`, `extends:`, `tags:`, and any `before_script:` to
-# match the patterns already used by existing jobs (e.g. bootstrap_linux_hosts,
-# patch_linux_servers). This snippet shows the job-specific bits only.
-#
-# This job tests target-host connectivity ONLY (no AWS Secrets Manager call).
-# =============================================================================
-
 ping_datadog_rotate:
-  stage: configure                # match whichever stage your config jobs use
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "web"'   # manual / Run-Pipeline only -- never auto
-      when: manual
+  <<: *common
+  stage: validate
+  image: $ANSIBLE_IMAGE
+  when: manual
+  needs:
+    - job: generate_inventory
+      artifacts: true
+  parallel:
+    matrix:
+      - LIMIT_PATTERN:
+          # Add/modify patterns as needed - each spawns an independent parallel job
+          # Supports mixed Linux + Windows patterns (the playbook handles both)
+          - "account_236024529161:&function_Development_Test"
+          # - "account_651611875653:&function_Development_Test"
+          # Examples of more specific filters:
+          # - "account_236024529161:&os_linux:&env_Production"     # Linux Production only
+          # - "account_236024529161:&os_windows:&env_Production"   # Windows Production only
+          # - "os_linux:&env_Production:&function_Database"        # All Linux prod databases
   variables:
-    LIMIT_PATTERN:
-      description: "Ansible --limit pattern. e.g. env_Sandbox:&os_linux  OR  env_Production  OR  account_236024529161:&os_windows"
-      value: ""
+    # Credentials accounts (same for all parallel jobs)
+    SSH_KEY_ACCOUNT_ID: "093737011827"
+    WIN_CREDS_ACCOUNT_ID: "093737011827"
+    WIN_SECRET_NAME: "windows_ansible_credentials"
   script:
+    - echo "=== Ping Datadog Rotate (pre-flight connectivity test) ==="
+    - echo "Limit Pattern -> ${LIMIT_PATTERN}"
+
+    # STEP 1: Setup SSH for Linux hosts
+    - echo "=== Step 1 -> Setting up SSH from account ${SSH_KEY_ACCOUNT_ID} ==="
+    - export AWS_ACCOUNT_ID="${SSH_KEY_ACCOUNT_ID}"
+    - *assume_role
+    - *setup_ssh
+
+    # STEP 2: Fetch Windows credentials (don't fail if only Linux is targeted)
+    - echo "=== Step 2 -> Fetching Windows credentials from account ${WIN_CREDS_ACCOUNT_ID} ==="
     - |
-      set -euo pipefail
-      if [ -z "${LIMIT_PATTERN}" ]; then
-        echo "ERROR: LIMIT_PATTERN must be set (e.g. env_Sandbox:&os_linux)" >&2
-        exit 2
+      set +e  # Don't fail if secret doesn't exist
+      WIN_CREDS=$(aws secretsmanager get-secret-value \
+        --secret-id "$WIN_SECRET_NAME" \
+        --region "$AWS_DEFAULT_REGION" \
+        --query "SecretString" \
+        --output text 2>/dev/null)
+      if [ $? -eq 0 ] && [ -n "$WIN_CREDS" ]; then
+        export WIN_USER=$(echo $WIN_CREDS | jq -r .username)
+        export WIN_PASS=$(echo $WIN_CREDS | jq -r .password)
+        echo "Windows credentials fetched successfully"
+      else
+        echo "Windows credentials not found (OK if only Linux hosts targeted)"
+        export WIN_USER=""
+        export WIN_PASS=""
       fi
-      ansible-playbook \
-        -i inventories/generated/static_inventory.yml \
-        playbooks/config/ping_datadog_rotate.yml \
-        --limit "${LIMIT_PATTERN}" \
-        2>&1 | tee ansible_output.log
+      set -e
+
+    # Create group_vars symlink next to inventory for Ansible to find it
+    # (Mirrors the verify_connectivity pattern exactly - all 12 files)
+    - mkdir -p $CI_PROJECT_DIR/inventories/generated/group_vars
+    - cp $CI_PROJECT_DIR/group_vars/os_linux.yml $CI_PROJECT_DIR/inventories/generated/group_vars/
+    - cp $CI_PROJECT_DIR/group_vars/version_AL2.yml $CI_PROJECT_DIR/inventories/generated/group_vars/
+    - cp $CI_PROJECT_DIR/group_vars/version_AL2023.yml $CI_PROJECT_DIR/inventories/generated/group_vars/
+    - cp $CI_PROJECT_DIR/group_vars/version_AL2023_Standard.yml $CI_PROJECT_DIR/inventories/generated/group_vars/
+    - cp $CI_PROJECT_DIR/group_vars/version_OEL8.yml $CI_PROJECT_DIR/inventories/generated/group_vars/
+    - cp $CI_PROJECT_DIR/group_vars/version_RHEL_7.yml $CI_PROJECT_DIR/inventories/generated/group_vars/
+    - cp $CI_PROJECT_DIR/group_vars/version_RHEL_7_9.yml $CI_PROJECT_DIR/inventories/generated/group_vars/
+    - cp $CI_PROJECT_DIR/group_vars/version_RHEL7.yml $CI_PROJECT_DIR/inventories/generated/group_vars/
+    - cp $CI_PROJECT_DIR/group_vars/version_RHEL_8.yml $CI_PROJECT_DIR/inventories/generated/group_vars/
+    - cp $CI_PROJECT_DIR/group_vars/version_RHEL_8_9.yml $CI_PROJECT_DIR/inventories/generated/group_vars/
+    - cp $CI_PROJECT_DIR/group_vars/version_RHEL_9.yml $CI_PROJECT_DIR/inventories/generated/group_vars/
+    - cp $CI_PROJECT_DIR/group_vars/os_windows.yml $CI_PROJECT_DIR/inventories/generated/group_vars/
+
+    # Run the ping playbook (handles both Linux SSH and Windows WinRM in one shot)
+    - |
+      su - ${ANSIBLE_USER} -c "export ANSIBLE_CONFIG=$CI_PROJECT_DIR/ansible.cfg && \
+        export ANSIBLE_WINRM_USER='$WIN_USER' && \
+        export ANSIBLE_WINRM_PASSWORD='$WIN_PASS' && \
+        export ANSIBLE_USER='${ANSIBLE_USER}' && \
+        export ANSIBLE_BECOME_PASSWORD='$ANSIBLE_BECOME_PASSWORD' && \
+        export CI_PROJECT_DIR='$CI_PROJECT_DIR' && \
+        cd $CI_PROJECT_DIR && \
+        ansible-playbook \
+          -i inventories/generated/static_inventory.yml \
+          --limit '${LIMIT_PATTERN}' \
+          playbooks/config/ping.yml \
+          -v" | tee ping_datadog_rotate_report.txt
+
+    # Summary
+    - echo ""
+    - echo "=== Ping Summary ==="
+    - |
+      UPDATE_COUNT=$(grep -c "rotate would.*UPDATE" ping_datadog_rotate_report.txt 2>/dev/null || echo 0)
+      SKIP_COUNT=$(grep -c "rotate would.*SKIP" ping_datadog_rotate_report.txt 2>/dev/null || echo 0)
+      UNREACHABLE=$(grep -c "UNREACHABLE\|FAILED" ping_datadog_rotate_report.txt 2>/dev/null || echo 0)
+      echo "Hosts that rotate WOULD update : $UPDATE_COUNT"
+      echo "Hosts that rotate would SKIP   : $SKIP_COUNT  (Datadog Agent not installed)"
+      echo "Hosts UNREACHABLE              : $UNREACHABLE"
+
+    # Commit results to git (matches existing pattern)
+    - export RESULT_TYPE="ping_datadog_rotate"
+    - *commit_results
   artifacts:
     when: always
-    expire_in: 30 days
     paths:
-      - ansible_output.log
+      - ping_datadog_rotate_report.txt
+    expire_in: 1 day
+  allow_failure: true
