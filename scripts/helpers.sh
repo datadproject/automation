@@ -33,7 +33,8 @@ parse_clusters() {
     secret_name:       (.secret_name // $d.secret_name // "datadog-secret"),
     secret_key:        (.secret_key // $d.secret_key // "api-key"),
     role_session_name: (.role_session_name // $d.role_session_name // "gitlab-ci"),
-    tags:              (.tags // [])
+    tags:              (.tags // []),
+    extra_secrets:     (.extra_secrets // [])
   }]' "$config_file"
 }
 
@@ -67,20 +68,20 @@ filter_clusters() {
       done
       local matched
       matched=$(echo "$all_clusters" | jq -c "[${jq_filter}]")
-      result=$(echo "$result" "$matched" | jq -s 'add | unique_by(.name)')
+      result=$(printf '%s\n%s' "$result" "$matched" | jq -s '(add // []) | unique_by(.name)')
 
     elif [[ "$part" == tag:* ]]; then
       local tag="${part#tag:}"
       local matched
       matched=$(echo "$all_clusters" | jq -c --arg t "$tag" \
         '[.[] | select(.tags | index($t))]')
-      result=$(echo "$result" "$matched" | jq -s 'add | unique_by(.name)')
+      result=$(printf '%s\n%s' "$result" "$matched" | jq -s '(add // []) | unique_by(.name)')
 
     else
       local matched
       matched=$(echo "$all_clusters" | jq -c --arg n "$part" \
         '[.[] | select(.name == $n)]')
-      result=$(echo "$result" "$matched" | jq -s 'add | unique_by(.name)')
+      result=$(printf '%s\n%s' "$result" "$matched" | jq -s '(add // []) | unique_by(.name)')
     fi
   done
 
