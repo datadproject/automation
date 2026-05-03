@@ -132,6 +132,60 @@ update_operator_secret() {
 }
 
 # ------------------------------------------------------------------------------
+# Update extra secrets in other namespaces (decoded from EXTRA_SECRETS_B64)
+# ------------------------------------------------------------------------------
+update_extra_secrets() {
+  local new_key="$1"
+  local extra_b64="${EXTRA_SECRETS_B64:-}"
+
+  if [[ -z "$extra_b64" ]]; then
+    return 0
+  fi
+
+  local extra_secrets
+  extra_secrets=$(echo "$extra_b64" | base64 -d 2>/dev/null || echo "[]")
+
+  local count
+  count=$(echo "$extra_secrets" | jq length)
+
+  if [[ "$count" -eq 0 ]]; then
+    return 0
+  fi
+
+  log_info "Updating ${count} extra secret(s) in other namespaces..."
+
+  local i
+  for (( i=0; i<count; i++ )); do
+    local ns sec_name sec_key restart_kind restart_name
+    ns=$(echo "$extra_secrets"           | jq -r ".[$i].namespace")
+    sec_name=$(echo "$extra_secrets"     | jq -r ".[$i].secret_name")
+    sec_key=$(echo "$extra_secrets"      | jq -r ".[$i].secret_key")
+    restart_kind=$(echo "$extra_secrets" | jq -r ".[$i].restart_kind // empty")
+    restart_name=$(echo "$extra_secrets" | jq -r ".[$i].restart_name // empty")
+
+    log_info "  Updating secret ${ns}/${sec_name} key=${sec_key}"
+
+    if kubectl get secret "$sec_name" -n "$ns" &>/dev/null; then
+      kubectl delete secret "$sec_name" -n "$ns"
+    fi
+
+    kubectl create secret generic "$sec_name" \
+      --from-literal="${sec_key}=${new_key}" \
+      -n "$ns"
+
+    log_info "  Secret ${ns}/${sec_name} updated."
+
+    # Restart the workload that uses this secret (if specified)
+    if [[ -n "$restart_kind" && -n "$restart_name" ]]; then
+      log_info "  Restarting ${restart_kind}/${restart_name} in namespace ${ns}..."
+      kubectl rollout restart "${restart_kind}/${restart_name}" -n "$ns"
+      kubectl rollout status "${restart_kind}/${restart_name}" -n "$ns" --timeout="${ROLLOUT_TIMEOUT}"
+      log_info "  ${restart_name} restarted successfully."
+    fi
+  done
+}
+
+# ------------------------------------------------------------------------------
 # Restart Datadog agent pods to pick up the new key.
 #
 # Always explicitly restart the agent DaemonSet and cluster agent deployment.
@@ -287,13 +341,16 @@ main() {
   # Step 2: Configure kubectl
   setup_kubeconfig "$CLUSTER_NAME" "$AWS_REGION"
 
-  # Step 3: Update the secret
+  # Step 3: Update the primary secret
   retry 3 update_secret "$new_key"
 
-  # Step 4: Restart Datadog agents
+  # Step 4: Update extra secrets in other namespaces (if any)
+  update_extra_secrets "$new_key"
+
+  # Step 5: Restart Datadog agents
   restart_datadog_agents
 
-  # Step 5: Health check — pods are running
+  # Step 6: Health check — pods are running
   health_check
 
   # Clear assumed role for safety
