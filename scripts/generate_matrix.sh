@@ -27,16 +27,15 @@ main() {
   # Output as GitLab CI dotenv format — one variable per cluster
   # This will be sourced into the pipeline as a child pipeline config
   echo "$clusters" | jq -c '.[]' | while IFS= read -r cluster; do
-    local name cluster_name region role_arn namespace secret_name secret_key
-    name=$(echo "$cluster" | jq -r '.name')
-    cluster_name=$(echo "$cluster" | jq -r '.cluster_name')
-    region=$(echo "$cluster" | jq -r '.aws_region')
-    role_arn=$(echo "$cluster" | jq -r '.role_arn')
-    namespace=$(echo "$cluster" | jq -r '.namespace')
-    secret_name=$(echo "$cluster" | jq -r '.secret_name')
-    secret_key=$(echo "$cluster" | jq -r '.secret_key')
+    local job_name;    job_name=$(echo "$cluster"    | jq -r '.name')
+    local cluster_name; cluster_name=$(echo "$cluster" | jq -r '.cluster_name')
+    local region;      region=$(echo "$cluster"      | jq -r '.aws_region')
+    local role_arn;    role_arn=$(echo "$cluster"    | jq -r '.role_arn')
+    local namespace;   namespace=$(echo "$cluster"   | jq -r '.namespace')
+    local secret_name; secret_name=$(echo "$cluster" | jq -r '.secret_name')
+    local secret_key;  secret_key=$(echo "$cluster"  | jq -r '.secret_key')
 
-    echo "${name}|${cluster_name}|${region}|${role_arn}|${namespace}|${secret_name}|${secret_key}"
+    echo "${job_name}|${cluster_name}|${region}|${role_arn}|${namespace}|${secret_name}|${secret_key}"
   done > "${CI_PROJECT_DIR:-$(pwd)}/cluster_matrix.txt"
 
   # Also generate the child pipeline YAML for dynamic parallel jobs
@@ -104,17 +103,20 @@ generate_child_pipeline() {
 
   # Generate one job per cluster
   echo "$clusters" | jq -c '.[]' | while IFS= read -r cluster; do
-    local name cluster_name region role_arn namespace secret_name secret_key
-    name=$(echo "$cluster" | jq -r '.name')
-    cluster_name=$(echo "$cluster" | jq -r '.cluster_name')
-    region=$(echo "$cluster" | jq -r '.aws_region')
-    role_arn=$(echo "$cluster" | jq -r '.role_arn')
-    namespace=$(echo "$cluster" | jq -r '.namespace')
-    secret_name=$(echo "$cluster" | jq -r '.secret_name')
-    secret_key=$(echo "$cluster" | jq -r '.secret_key')
+    local name="${cluster}"
+    local cluster_name; cluster_name=$(echo "$cluster" | jq -r '.cluster_name')
+    local job_name;     job_name=$(echo "$cluster"     | jq -r '.name')
+    local region;       region=$(echo "$cluster"        | jq -r '.aws_region')
+    local role_arn;     role_arn=$(echo "$cluster"      | jq -r '.role_arn')
+    local namespace;    namespace=$(echo "$cluster"     | jq -r '.namespace')
+    local secret_name;  secret_name=$(echo "$cluster"  | jq -r '.secret_name')
+    local secret_key;   secret_key=$(echo "$cluster"   | jq -r '.secret_key')
+    # Base64-encode extra_secrets JSON so it survives being a CI variable value
+    local extra_secrets_json; extra_secrets_json=$(echo "$cluster" | jq -c '.extra_secrets // []')
+    local extra_secrets_b64;  extra_secrets_b64=$(printf '%s' "$extra_secrets_json" | base64 | tr -d '\n')
 
     cat >> "$output" << EOF
-rollout-${name}:
+rollout-${job_name}:
   extends: .rollout_template
   variables:
     CLUSTER_NAME: "${cluster_name}"
@@ -123,6 +125,7 @@ rollout-${name}:
     K8S_NAMESPACE: "${namespace}"
     K8S_SECRET_NAME: "${secret_name}"
     K8S_SECRET_KEY: "${secret_key}"
+    EXTRA_SECRETS_B64: "${extra_secrets_b64}"
 
 EOF
   done
