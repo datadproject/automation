@@ -7,11 +7,11 @@
   },
   "clusters": [
     {
-      "name": "prod-us-gov-west-1-fps",
-      "aws_account_id": "060597140294",
-      "aws_region": "us-gov-west-1",
-      "cluster_name": "NGDC-FPS-EKS-cluster",
-      "role_arn": "arn:aws-us-gov:iam::060597140294:role/NGDCGitLabTerraformAdminRole"
+      "name": "prod-us-west-1-",
+      "aws_account_id": "",
+      "aws_region": "us--west-1",
+      "cluster_name": "-EKS-cluster",
+      "role_arn": "arn:aws-us:iam:::role/"
     }
   ]
 }
