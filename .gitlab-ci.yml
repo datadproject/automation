@@ -30,11 +30,11 @@ variables:
   # ---------------------------------------------------------------------------
   # Cluster targeting — set when triggering manually to target a subset.
   #   ""  or "all"                           — All clusters (default)
-  #   "prod-us-gov-west-1-fps"              — Single cluster by name
-  #   "prod-us-gov-west-1-fps,prod-data"    — Multiple clusters by name
+  #   "prod-us-west-1-fps"              — Single cluster by name
+  #   "prod-us-west-1-fps,prod-data"    — Multiple clusters by name
   #   "tag:prod"                            — All clusters tagged "prod"
   #   "tag:wave-1"                          — Rollout wave 1 only
-  #   "tag:prod+us-gov-west-1"              — Clusters with BOTH tags (AND)
+  #   "tag:prod+us-west-1"              — Clusters with BOTH tags (AND)
   # ---------------------------------------------------------------------------
   CLUSTER_FILTER: ""
   # Set to "true" to skip key creation and only push the current key
