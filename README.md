@@ -1,6 +1,6 @@
 # Datadog API Key Rotation — Automated Pipeline
 
-Automated rotation of Datadog GovCloud API keys across 30+ EKS clusters in separate AWS accounts, orchestrated via self-hosted GitLab CI.
+Automated rotation of Datadog API keys across 30+ EKS clusters in separate AWS accounts, orchestrated via self-hosted GitLab CI.
 
 ## Architecture
 
@@ -8,7 +8,7 @@ Automated rotation of Datadog GovCloud API keys across 30+ EKS clusters in separ
 GitLab CI (scheduled every 60 days)
   │
   ├── Stage 1: rotate_key.sh
-  │     → Create new DD API key via Datadog GovCloud API
+  │     → Create new DD API key via Datadog API
   │     → Update GitLab CI/CD masked variable
   │
   ├── Stage 2: generate_matrix.sh
@@ -44,9 +44,9 @@ Set these as **protected, masked** variables in your project settings:
 | `GITLAB_TOKEN` | Project Access Token with `api` scope (to update variables) | Yes | Yes |
 | `SLACK_WEBHOOK_URL` | (Optional) Slack incoming webhook for notifications | Yes | No |
 
-### 2. Datadog Application Key Permissions (GovCloud)
+### 2. Datadog Application Key Permissions ()
 
-The `DD_APP_KEY` needs these scopes in Datadog GovCloud (`app.ddog-gov.com`):
+The `DD_APP_KEY` needs these scopes in Datadog (`app.ddog.com`):
 - `api_keys_write` — create and delete API keys
 - `api_keys_read` — list API keys
 
