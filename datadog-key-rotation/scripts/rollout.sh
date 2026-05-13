@@ -16,7 +16,7 @@
 #   K8S_NAMESPACE      — Namespace where DD secret lives (default: datadog)
 #   K8S_SECRET_NAME    — K8s secret name (default: datadog-secret)
 #   K8S_SECRET_KEY     — Key in the secret data map (default: api-key)
-#   ROTATION_STATE_FILE — Path to rotation state JSON from stage 1
+#   NEW_DD_API_KEY     — The new API key (injected by generate_matrix.sh)
 # ==============================================================================
 set -euo pipefail
 
@@ -26,8 +26,7 @@ source "${SCRIPT_DIR}/helpers.sh"
 K8S_NAMESPACE="${K8S_NAMESPACE:-datadog}"
 K8S_SECRET_NAME="${K8S_SECRET_NAME:-datadog-secret}"
 K8S_SECRET_KEY="${K8S_SECRET_KEY:-api-key}"
-ROTATION_STATE_FILE="${ROTATION_STATE_FILE:-${CI_PROJECT_DIR:-$(pwd)}/rotation_state.json}"
-ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-300s}"
+ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-600s}"
 
 # ------------------------------------------------------------------------------
 # Update the Kubernetes secret with the new API key
@@ -35,6 +34,14 @@ ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-300s}"
 # ------------------------------------------------------------------------------
 update_secret() {
   local new_key="$1"
+
+  # Debug: confirm we have an actual key value, not a variable reference
+  log_info "NEW_DD_API_KEY length: ${#new_key} chars, last4: ${new_key: -4}"
+  if [[ "$new_key" == *"GITLAB"* || "$new_key" == *"TOKEN"* || "$new_key" == *"{"* ]]; then
+    log_error "NEW_DD_API_KEY contains a variable reference instead of actual key value!"
+    log_error "Value looks like a literal variable name. Check child-pipeline.yml generation."
+    exit 1
+  fi
 
   log_info "Updating secret ${K8S_NAMESPACE}/${K8S_SECRET_NAME} key=${K8S_SECRET_KEY}"
 
@@ -50,54 +57,187 @@ update_secret() {
     --from-literal="${K8S_SECRET_KEY}=${new_key}" \
     -n "$K8S_NAMESPACE"
 
-  log_info "Secret updated successfully."
+  # Verify what was actually written
+  local written_key
+  written_key=$(kubectl get secret "$K8S_SECRET_NAME" -n "$K8S_NAMESPACE" \
+    -o jsonpath="{.data.${K8S_SECRET_KEY}}" | base64 -d)
+  log_info "Secret written. Verify last4: ${written_key: -4}"
+
+  log_info "Secret ${K8S_SECRET_NAME} updated successfully."
+
+  # Also update any OTHER secrets referenced by the DatadogAgent CR (operator)
+  update_operator_secret "$new_key"
 }
 
 # ------------------------------------------------------------------------------
-# Restart Datadog agent pods to pick up the new key
+# Check if Datadog Operator's DatadogAgent CR references a different secret.
+# If so, update that secret too.
+# ------------------------------------------------------------------------------
+update_operator_secret() {
+  local new_key="$1"
+
+  # Check if a DatadogAgent CR exists
+  local dda_name
+  dda_name=$(kubectl get datadogagent -n "$K8S_NAMESPACE" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+  if [[ -z "$dda_name" ]]; then
+    log_info "No DatadogAgent CR found — skipping operator secret check."
+    return 0
+  fi
+
+  log_info "Found DatadogAgent CR: ${dda_name}"
+
+  # Get the secret name the operator uses for the API key
+  local operator_secret_name operator_secret_key
+  operator_secret_name=$(kubectl get datadogagent "$dda_name" -n "$K8S_NAMESPACE" \
+    -o jsonpath='{.spec.credentials.apiSecret.secretName}' 2>/dev/null || true)
+  operator_secret_key=$(kubectl get datadogagent "$dda_name" -n "$K8S_NAMESPACE" \
+    -o jsonpath='{.spec.credentials.apiSecret.keyName}' 2>/dev/null || true)
+
+  # Fallback: check under spec.global.credentials (newer operator versions)
+  if [[ -z "$operator_secret_name" ]]; then
+    operator_secret_name=$(kubectl get datadogagent "$dda_name" -n "$K8S_NAMESPACE" \
+      -o jsonpath='{.spec.global.credentials.apiSecret.secretName}' 2>/dev/null || true)
+    operator_secret_key=$(kubectl get datadogagent "$dda_name" -n "$K8S_NAMESPACE" \
+      -o jsonpath='{.spec.global.credentials.apiSecret.keyName}' 2>/dev/null || true)
+  fi
+
+  # Default key name if not specified
+  operator_secret_key="${operator_secret_key:-api-key}"
+
+  if [[ -z "$operator_secret_name" ]]; then
+    log_info "DatadogAgent CR does not specify a separate apiSecret — using default secret."
+    return 0
+  fi
+
+  # If the operator uses the same secret we already updated, skip
+  if [[ "$operator_secret_name" == "$K8S_SECRET_NAME" ]]; then
+    log_info "Operator uses same secret (${K8S_SECRET_NAME}) — already updated."
+    return 0
+  fi
+
+  # Update the operator's secret too
+  log_info "Operator uses different secret: ${operator_secret_name} key=${operator_secret_key}"
+  log_info "Updating operator secret..."
+
+  if kubectl get secret "$operator_secret_name" -n "$K8S_NAMESPACE" &>/dev/null; then
+    kubectl delete secret "$operator_secret_name" -n "$K8S_NAMESPACE"
+  fi
+
+  kubectl create secret generic "$operator_secret_name" \
+    --from-literal="${operator_secret_key}=${new_key}" \
+    -n "$K8S_NAMESPACE"
+
+  log_info "Operator secret ${operator_secret_name} updated."
+}
+
+# ------------------------------------------------------------------------------
+# Update extra secrets in other namespaces (decoded from EXTRA_SECRETS_B64)
+# ------------------------------------------------------------------------------
+update_extra_secrets() {
+  local new_key="$1"
+  local extra_b64="${EXTRA_SECRETS_B64:-}"
+
+  if [[ -z "$extra_b64" ]]; then
+    return 0
+  fi
+
+  local extra_secrets
+  extra_secrets=$(echo "$extra_b64" | base64 -d 2>/dev/null || echo "[]")
+
+  local count
+  count=$(echo "$extra_secrets" | jq length)
+
+  if [[ "$count" -eq 0 ]]; then
+    return 0
+  fi
+
+  log_info "Updating ${count} extra secret(s) in other namespaces..."
+
+  local i
+  for (( i=0; i<count; i++ )); do
+    local ns sec_name sec_key restart_kind restart_name
+    ns=$(echo "$extra_secrets"           | jq -r ".[$i].namespace")
+    sec_name=$(echo "$extra_secrets"     | jq -r ".[$i].secret_name")
+    sec_key=$(echo "$extra_secrets"      | jq -r ".[$i].secret_key")
+    restart_kind=$(echo "$extra_secrets" | jq -r ".[$i].restart_kind // empty")
+    restart_name=$(echo "$extra_secrets" | jq -r ".[$i].restart_name // empty")
+
+    log_info "  Updating secret ${ns}/${sec_name} key=${sec_key}"
+
+    if kubectl get secret "$sec_name" -n "$ns" &>/dev/null; then
+      kubectl delete secret "$sec_name" -n "$ns"
+    fi
+
+    kubectl create secret generic "$sec_name" \
+      --from-literal="${sec_key}=${new_key}" \
+      -n "$ns"
+
+    log_info "  Secret ${ns}/${sec_name} updated."
+
+    # Restart the workload that uses this secret (if specified)
+    if [[ -n "$restart_kind" && -n "$restart_name" ]]; then
+      log_info "  Restarting ${restart_kind}/${restart_name} in namespace ${ns}..."
+      kubectl rollout restart "${restart_kind}/${restart_name}" -n "$ns"
+      kubectl rollout status "${restart_kind}/${restart_name}" -n "$ns" --timeout="${ROLLOUT_TIMEOUT}"
+      log_info "  ${restart_name} restarted successfully."
+    fi
+  done
+}
+
+# ------------------------------------------------------------------------------
+# Restart Datadog agent pods to pick up the new key.
+#
+# Always explicitly restart the agent DaemonSet and cluster agent deployment.
+# The operator does NOT auto-reconcile when the K8s secret changes, so we
+# must trigger restarts ourselves.
 # ------------------------------------------------------------------------------
 restart_datadog_agents() {
   log_info "Triggering rolling restart of Datadog agent resources..."
 
-  # Try Datadog Operator first
-  if kubectl get deployment datadog-operator -n "$K8S_NAMESPACE" &>/dev/null; then
-    log_info "Detected Datadog Operator deployment. Restarting operator..."
-    kubectl rollout restart deployment/datadog-operator -n "$K8S_NAMESPACE"
-    kubectl rollout status deployment/datadog-operator -n "$K8S_NAMESPACE" --timeout="$ROLLOUT_TIMEOUT"
-  fi
-
-  # Restart the agent DaemonSet
+  # 1. Restart agent DaemonSet
   local agent_ds
   agent_ds=$(kubectl get daemonset -n "$K8S_NAMESPACE" -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 
-  if [[ -n "$agent_ds" ]]; then
-    log_info "Restarting DaemonSet: ${agent_ds}"
-    kubectl rollout restart daemonset/"$agent_ds" -n "$K8S_NAMESPACE"
-    kubectl rollout status daemonset/"$agent_ds" -n "$K8S_NAMESPACE" --timeout="$ROLLOUT_TIMEOUT"
-  else
-    log_warn "No Datadog agent DaemonSet found with label app.kubernetes.io/component=agent"
-    # Fallback: try common names used by operator/helm
+  if [[ -z "$agent_ds" ]]; then
     for ds_name in datadog-agent datadogagent datadog; do
       if kubectl get daemonset "$ds_name" -n "$K8S_NAMESPACE" &>/dev/null; then
-        log_info "Restarting DaemonSet: ${ds_name}"
-        kubectl rollout restart daemonset/"$ds_name" -n "$K8S_NAMESPACE"
-        kubectl rollout status daemonset/"$ds_name" -n "$K8S_NAMESPACE" --timeout="$ROLLOUT_TIMEOUT"
+        agent_ds="$ds_name"
         break
       fi
     done
   fi
 
-  # Restart cluster agent if present
+  if [[ -n "$agent_ds" ]]; then
+    log_info "Restarting DaemonSet: ${agent_ds}"
+    kubectl rollout restart daemonset/"$agent_ds" -n "$K8S_NAMESPACE"
+    log_info "Waiting for all ${agent_ds} pods to be ready (no timeout)..."
+    kubectl rollout status daemonset/"$agent_ds" -n "$K8S_NAMESPACE"
+  else
+    log_warn "No Datadog agent DaemonSet found in namespace ${K8S_NAMESPACE}"
+  fi
+
+  # 2. Restart cluster agent deployment
   local cluster_agent_deploy
   cluster_agent_deploy=$(kubectl get deployment -n "$K8S_NAMESPACE" -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 
-  if [[ -n "$cluster_agent_deploy" ]]; then
-    log_info "Restarting Cluster Agent deployment: ${cluster_agent_deploy}"
-    kubectl rollout restart deployment/"$cluster_agent_deploy" -n "$K8S_NAMESPACE"
-    kubectl rollout status deployment/"$cluster_agent_deploy" -n "$K8S_NAMESPACE" --timeout="$ROLLOUT_TIMEOUT"
+  if [[ -z "$cluster_agent_deploy" ]]; then
+    for dep_name in datadog-cluster-agent datadogagent-cluster-agent; do
+      if kubectl get deployment "$dep_name" -n "$K8S_NAMESPACE" &>/dev/null; then
+        cluster_agent_deploy="$dep_name"
+        break
+      fi
+    done
   fi
 
-  log_info "All Datadog agent resources restarted."
+  if [[ -n "$cluster_agent_deploy" ]]; then
+    log_info "Restarting Cluster Agent: ${cluster_agent_deploy}"
+    kubectl rollout restart deployment/"$cluster_agent_deploy" -n "$K8S_NAMESPACE"
+    log_info "Waiting for cluster agent pods to be ready..."
+    kubectl rollout status deployment/"$cluster_agent_deploy" -n "$K8S_NAMESPACE"
+  fi
+
+  log_info "Agent restart phase complete."
 }
 
 # ------------------------------------------------------------------------------
@@ -130,23 +270,68 @@ health_check() {
 }
 
 # ------------------------------------------------------------------------------
+# Verify this cluster is reporting to Datadog with the new API key.
+# Polls the Datadog API until at least one host with this cluster's tag is
+# seen, or gives up after VERIFY_POLL_TIMEOUT seconds (default: 5 minutes).
+# This runs per-cluster inside the rollout job — no separate verify stage needed.
+# ------------------------------------------------------------------------------
+DD_API_BASE="https://api.ddog-gov.com"
+VERIFY_POLL_TIMEOUT="${VERIFY_POLL_TIMEOUT:-300}"
+VERIFY_POLL_INTERVAL="${VERIFY_POLL_INTERVAL:-30}"
+
+verify_cluster_reporting() {
+  local new_key="$1"
+  local cluster_name="$2"
+
+  # DD_APP_KEY is required for the Datadog API query
+  if [[ -z "${DD_APP_KEY:-}" ]]; then
+    log_warn "DD_APP_KEY not set — skipping Datadog API verification."
+    log_warn "Pods are running but cannot confirm Datadog is receiving data."
+    return 0
+  fi
+
+  log_info "Verifying ${cluster_name} is reporting to Datadog with the new key..."
+
+  local start_time elapsed
+  start_time=$(date +%s)
+
+  while true; do
+    elapsed=$(( $(date +%s) - start_time ))
+
+    local response total
+    response=$(curl -sf -X GET \
+      "${DD_API_BASE}/api/v1/hosts?filter=kube_cluster_name:${cluster_name}&count=1&from=$(( $(date +%s) - 900 ))" \
+      -H "DD-API-KEY: ${new_key}" \
+      -H "DD-APPLICATION-KEY: ${DD_APP_KEY}" 2>/dev/null || echo '{"total_matching": 0}')
+
+    total=$(echo "$response" | jq -r '.total_matching // 0')
+
+    if [[ "$total" -gt 0 ]]; then
+      log_info "Verified: ${cluster_name} is reporting to Datadog (${total} host(s) found)."
+      return 0
+    fi
+
+    if (( elapsed >= VERIFY_POLL_TIMEOUT )); then
+      log_warn "Verification warning: ${cluster_name} not yet reporting to Datadog after ${VERIFY_POLL_TIMEOUT}s."
+      log_warn "Pods are running but Datadog API shows no hosts yet. It may still be propagating."
+      return 0
+    fi
+
+    log_info "Not yet reporting (${elapsed}s/${VERIFY_POLL_TIMEOUT}s). Retrying in ${VERIFY_POLL_INTERVAL}s..."
+    sleep "$VERIFY_POLL_INTERVAL"
+  done
+}
+
+# ------------------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------------------
 main() {
   log_info "========== Stage 2: Rollout to ${CLUSTER_NAME} (${AWS_REGION}) =========="
 
-  setup_proxy
+  local new_key="${NEW_DD_API_KEY:-}"
 
-  if [[ ! -f "$ROTATION_STATE_FILE" ]]; then
-    log_error "Rotation state file not found: ${ROTATION_STATE_FILE}"
-    exit 1
-  fi
-
-  local new_key
-  new_key=$(jq -r '.new_key' "$ROTATION_STATE_FILE")
-
-  if [[ -z "$new_key" || "$new_key" == "null" ]]; then
-    log_error "New API key not found in rotation state file."
+  if [[ -z "$new_key" ]]; then
+    log_error "NEW_DD_API_KEY is not set. Check that generate_matrix.sh ran correctly."
     exit 1
   fi
 
@@ -156,13 +341,16 @@ main() {
   # Step 2: Configure kubectl
   setup_kubeconfig "$CLUSTER_NAME" "$AWS_REGION"
 
-  # Step 3: Update the secret
+  # Step 3: Update the primary secret
   retry 3 update_secret "$new_key"
 
-  # Step 4: Restart Datadog agents
+  # Step 4: Update extra secrets in other namespaces (if any)
+  update_extra_secrets "$new_key"
+
+  # Step 5: Restart Datadog agents
   restart_datadog_agents
 
-  # Step 5: Health check
+  # Step 6: Health check — pods are running
   health_check
 
   # Clear assumed role for safety

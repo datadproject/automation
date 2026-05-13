@@ -1,0 +1,135 @@
+# ==============================================================================
+# infra-pipeline.gitlab-ci.yml — Infrastructure Bootstrap Pipeline
+# ==============================================================================
+# Manages the hub account infrastructure: KMS key, Secrets Manager containers,
+# IAM roles. Run this pipeline ONCE to bootstrap, then only when infra changes.
+#
+# To run: GitLab > CI/CD > Pipelines > Run pipeline
+#         Select branch, set pipeline source to "web"
+#
+# Required GitLab CI Protected Variables (Settings > CI/CD > Variables):
+#   TF_VAR_hub_account_id          — Hub account AWS account ID
+#   TF_VAR_gitlab_runner_account_id — Runner account AWS account ID
+#   TF_STATE_BUCKET                — S3 bucket for Terraform state (in hub account)
+#   TF_STATE_KEY                   — S3 key prefix (e.g. datadog-rotation/terraform.tfstate)
+#   TF_STATE_REGION                — S3 bucket region (us-gov-west-1)
+#   TF_STATE_KMS_KEY               — KMS key ARN or alias for state bucket encryption
+#
+# The runner must have IAM permissions in the hub account to create:
+#   KMS keys, Secrets Manager secrets, IAM roles and policies.
+# Use the runner's existing cross-account role or the hub account's admin role.
+# ==============================================================================
+
+stages:
+  - validate
+  - plan
+  - apply
+  - seed-secrets
+
+variables:
+  TF_ROOT: "${CI_PROJECT_DIR}/infra"
+  TF_IN_AUTOMATION: "true"
+
+.terraform-base:
+  tags:
+    - EKS_RUNNER_GITLAB
+  before_script:
+    # Terraform is already installed on the shell executor runner.
+    # If not, install with: curl -L https://releases.hashicorp.com/terraform/1.7.0/terraform_1.7.0_linux_amd64.zip
+    - terraform version
+    - cd "${TF_ROOT}"
+    - terraform init
+        -backend-config="bucket=${TF_STATE_BUCKET}"
+        -backend-config="key=${TF_STATE_KEY}"
+        -backend-config="region=${TF_STATE_REGION}"
+        -backend-config="encrypt=true"
+        -backend-config="kms_key_id=${TF_STATE_KMS_KEY}"
+        -reconfigure
+
+# ==============================================================================
+# validate — syntax + provider check (no AWS calls)
+# ==============================================================================
+tf-validate:
+  extends: .terraform-base
+  stage: validate
+  script:
+    - terraform validate
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - infra/**/*
+
+# ==============================================================================
+# plan — show what will change, save plan artifact (no changes applied)
+# ==============================================================================
+tf-plan:
+  extends: .terraform-base
+  stage: plan
+  script:
+    - terraform plan
+        -out="${CI_PROJECT_DIR}/tfplan"
+        -no-color
+        -input=false
+  artifacts:
+    name: "terraform-plan-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - tfplan
+    expire_in: 1 hour
+    # Plan file is not sensitive (no secret values are in Terraform code or state)
+  needs:
+    - tf-validate
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - infra/**/*
+
+# ==============================================================================
+# apply — create/update infrastructure (requires manual approval)
+# Review the plan output before approving.
+# ==============================================================================
+tf-apply:
+  extends: .terraform-base
+  stage: apply
+  script:
+    - terraform apply -auto-approve -input=false "${CI_PROJECT_DIR}/tfplan"
+    - echo "=== OUTPUTS (copy HUB_ACCOUNT_ROLE_ARN into GitLab CI variables) ==="
+    - terraform output
+  needs:
+    - tf-plan
+  when: manual
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+
+# ==============================================================================
+# seed-secrets — ONE-TIME job to populate initial API key values.
+#
+# Reads the current Datadog API key from masked GitLab CI variables and
+# pushes each value into Secrets Manager. No values are hardcoded in files.
+#
+# Required GitLab CI masked+protected variables (set once, can remove after):
+#   DD_INITIAL_KEY_LOWER   — Current Datadog API key for lower env
+#   DD_INITIAL_KEY_IST     — Current Datadog API key for ist env
+#   DD_INITIAL_KEY_UAT     — Current Datadog API key for uat env
+#   DD_INITIAL_KEY_EPT     — Current Datadog API key for ept env
+#   DD_INITIAL_KEY_STAGE   — Current Datadog API key for stage env
+#   DD_INITIAL_KEY_PROD    — Current Datadog API key for prod env
+#   HUB_ACCOUNT_ROLE_ARN   — ARN from tf-apply output
+#   HUB_ACCOUNT_REGION     — us-gov-west-1
+#
+# After this job runs successfully, the initial variables can be removed
+# from GitLab CI — Secrets Manager holds the values from this point on.
+# ==============================================================================
+seed-secrets:
+  tags:
+    - EKS_RUNNER_GITLAB
+  stage: seed-secrets
+  script:
+    - source scripts/helpers.sh
+    - bash scripts/seed_secrets.sh
+  needs:
+    - tf-apply
+  when: manual
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'

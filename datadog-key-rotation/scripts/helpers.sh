@@ -3,68 +3,48 @@
 # helpers.sh — Shared functions for Datadog API key rotation pipeline
 # ==============================================================================
 # Environment: AWS GovCloud, self-hosted GitLab, shell executor runners
+#
+# NOTE: This file does NOT set "set -euo pipefail". Each script that sources
+# this file controls its own error handling. This prevents sourcing from
+# killing the caller's shell on unset variables.
 # ==============================================================================
-set -euo pipefail
-
-# ------------------------------------------------------------------------------
-# Proxy configuration (matches existing pipeline pattern)
-# Override via env vars if your proxy differs per runner.
-# ------------------------------------------------------------------------------
-setup_proxy() {
-  export HTTPS_PROXY="${HTTPS_PROXY:-10.111.225.254:8080}"
-  export NO_PROXY="${NO_PROXY:-.sk1.us-gov-west-1.eks.amazonaws.com}"
-  log_info "Proxy configured: HTTPS_PROXY=${HTTPS_PROXY}"
-}
 
 # ------------------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------------------
-log_info()  { echo "[INFO]  $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*"; }
+log_info()  { echo "[INFO]  $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*" >&2; }
 log_warn()  { echo "[WARN]  $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*" >&2; }
 log_error() { echo "[ERROR] $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*" >&2; }
 
 # ------------------------------------------------------------------------------
-# Parse clusters.yml — requires yq v4+
+# Parse clusters.json — requires yq v4+
 # Outputs JSON array of cluster objects with defaults merged.
 # ------------------------------------------------------------------------------
 parse_clusters() {
-  local config_file="${1:-config/clusters.yml}"
+  local config_file="${1:-config/clusters.json}"
 
-  yq eval -o=json '
-    .clusters[] as $c |
-    {
-      "name":            $c.name,
-      "aws_account_id":  $c.aws_account_id,
-      "aws_region":      $c.aws_region,
-      "cluster_name":    $c.cluster_name,
-      "role_arn":         $c.role_arn,
-      "namespace":       ($c.namespace // .defaults.namespace),
-      "secret_name":     ($c.secret_name // .defaults.secret_name),
-      "secret_key":      ($c.secret_key // .defaults.secret_key),
-      "role_session_name": ($c.role_session_name // .defaults.role_session_name),
-      "tags":            ($c.tags // [])
-    }
-  ' "$config_file" | jq -s '.'
+  jq '[.defaults as $d | .clusters[] | {
+    name,
+    aws_account_id,
+    aws_region,
+    cluster_name,
+    role_arn,
+    namespace:         (.namespace // $d.namespace // "datadog"),
+    secret_name:       (.secret_name // $d.secret_name // "datadog-secret"),
+    secret_key:        (.secret_key // $d.secret_key // "api-key"),
+    role_session_name: (.role_session_name // $d.role_session_name // "gitlab-ci"),
+    tags:              (.tags // []),
+    extra_secrets:     (.extra_secrets // [])
+  }]' "$config_file"
 }
 
 # ------------------------------------------------------------------------------
 # Filter clusters based on CLUSTER_FILTER env var.
-# Input:  JSON array of cluster objects (from parse_clusters)
-# Output: Filtered JSON array
-#
-# CLUSTER_FILTER formats:
-#   ""  or "all"                        — No filter, return all clusters
-#   "name1,name2,name3"                 — Match by cluster name (comma-separated)
-#   "tag:prod"                          — Match clusters that have the "prod" tag
-#   "tag:prod,tag:us"                   — Match clusters that have ANY of the listed tags (OR)
-#   "tag:prod+us"                       — Match clusters that have ALL listed tags (AND)
-#   "name1,tag:eu"                      — Mix names and tags (OR logic between them)
 # ------------------------------------------------------------------------------
 filter_clusters() {
   local all_clusters="$1"
   local filter="${CLUSTER_FILTER:-all}"
 
-  # No filter — return everything
   if [[ -z "$filter" || "$filter" == "all" ]]; then
     echo "$all_clusters"
     return 0
@@ -73,43 +53,35 @@ filter_clusters() {
   log_info "Applying cluster filter: ${filter}"
 
   local result="[]"
-
-  # Split filter by comma
   IFS=',' read -ra filter_parts <<< "$filter"
 
   for part in "${filter_parts[@]}"; do
-    part=$(echo "$part" | xargs)  # trim whitespace
+    part=$(echo "$part" | xargs)
 
     if [[ "$part" == tag:*+* ]]; then
-      # AND tag filter: tag:prod+us → must have ALL tags
       local tag_expr="${part#tag:}"
       IFS='+' read -ra and_tags <<< "$tag_expr"
-
-      # Build jq filter: all tags must be present
       local jq_filter=".[]"
       for tag in "${and_tags[@]}"; do
         tag=$(echo "$tag" | xargs)
         jq_filter="${jq_filter} | select(.tags | index(\"${tag}\"))"
       done
-
       local matched
       matched=$(echo "$all_clusters" | jq -c "[${jq_filter}]")
-      result=$(echo "$result" "$matched" | jq -s 'add | unique_by(.name)')
+      result=$(printf '%s\n%s' "$result" "$matched" | jq -s '(add // []) | unique_by(.name)')
 
     elif [[ "$part" == tag:* ]]; then
-      # Single tag filter: tag:prod
       local tag="${part#tag:}"
       local matched
       matched=$(echo "$all_clusters" | jq -c --arg t "$tag" \
         '[.[] | select(.tags | index($t))]')
-      result=$(echo "$result" "$matched" | jq -s 'add | unique_by(.name)')
+      result=$(printf '%s\n%s' "$result" "$matched" | jq -s '(add // []) | unique_by(.name)')
 
     else
-      # Name filter: match by cluster inventory name
       local matched
       matched=$(echo "$all_clusters" | jq -c --arg n "$part" \
         '[.[] | select(.name == $n)]')
-      result=$(echo "$result" "$matched" | jq -s 'add | unique_by(.name)')
+      result=$(printf '%s\n%s' "$result" "$matched" | jq -s '(add // []) | unique_by(.name)')
     fi
   done
 
@@ -118,8 +90,8 @@ filter_clusters() {
   log_info "Filter matched ${count} cluster(s)"
 
   if [[ "$count" -eq 0 ]]; then
-    log_error "CLUSTER_FILTER '${filter}' matched zero clusters. Check filter and clusters.yml."
-    exit 1
+    log_error "CLUSTER_FILTER '${filter}' matched zero clusters. Check filter and clusters.json."
+    return 1
   fi
 
   echo "$result"
@@ -128,7 +100,6 @@ filter_clusters() {
 # ------------------------------------------------------------------------------
 # Assume an IAM role via STS and export credentials into the current shell.
 # Uses the same read/query pattern as the existing datadog_operator pipeline.
-# Usage: assume_role <role_arn> <session_name>
 # ------------------------------------------------------------------------------
 assume_role() {
   local role_arn="$1"
@@ -145,13 +116,12 @@ assume_role() {
 
   export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 
-  # Sanity check
   aws sts get-caller-identity
   log_info "Assumed role successfully."
 }
 
 # ------------------------------------------------------------------------------
-# Clear assumed-role credentials, reverting to the pipeline's base identity.
+# Clear assumed-role credentials
 # ------------------------------------------------------------------------------
 clear_assumed_role() {
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
@@ -159,7 +129,6 @@ clear_assumed_role() {
 
 # ------------------------------------------------------------------------------
 # Configure kubectl for an EKS cluster.
-# Usage: setup_kubeconfig <cluster_name> <region>
 # ------------------------------------------------------------------------------
 setup_kubeconfig() {
   local cluster_name="$1"
@@ -173,7 +142,6 @@ setup_kubeconfig() {
 
 # ------------------------------------------------------------------------------
 # Retry a command with exponential backoff.
-# Usage: retry <max_attempts> <command> [args...]
 # ------------------------------------------------------------------------------
 retry() {
   local max_attempts="$1"; shift

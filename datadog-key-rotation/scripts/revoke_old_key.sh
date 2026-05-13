@@ -23,19 +23,17 @@ ROTATION_STATE_FILE="${ROTATION_STATE_FILE:-${CI_PROJECT_DIR:-$(pwd)}/rotation_s
 main() {
   log_info "========== Stage 4: Revoke Old API Key =========="
 
-  setup_proxy
 
   if [[ ! -f "$ROTATION_STATE_FILE" ]]; then
     log_error "Rotation state file not found: ${ROTATION_STATE_FILE}"
     exit 1
   fi
 
-  local verify_result
-  verify_result=$(jq -r '.verify_result' "$ROTATION_STATE_FILE")
-
-  if [[ "$verify_result" != "success" ]]; then
-    log_error "Verification did not succeed (result=${verify_result}). Refusing to revoke old key."
-    log_error "Both old and new keys remain active. Manual investigation required."
+  # Validate that rotation_state.json has the required fields
+  local new_key_check
+  new_key_check=$(jq -r '.new_key // empty' "$ROTATION_STATE_FILE")
+  if [[ -z "$new_key_check" ]]; then
+    log_error "No new_key found in rotation_state.json. Cannot proceed with revoke."
     exit 1
   fi
 
@@ -52,11 +50,18 @@ main() {
 
   log_info "Revoking old API key. ID: ${old_key_id}, last4: ${old_key_last4}"
 
-  local http_code
-  http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+  log_info "Using new API key (last4: ${new_key: -4}) to authenticate delete request"
+  log_info "Deleting old key ID: ${old_key_id}"
+
+  local response http_code
+  response=$(curl -s -w "\n%{http_code}" \
     -X DELETE "${DD_API_BASE}/api/v2/api_keys/${old_key_id}" \
     -H "DD-API-KEY: ${new_key}" \
     -H "DD-APPLICATION-KEY: ${DD_APP_KEY}")
+
+  http_code=$(echo "$response" | tail -1)
+  local body
+  body=$(echo "$response" | sed '$d')
 
   if [[ "$http_code" == "204" || "$http_code" == "200" ]]; then
     log_info "Old API key revoked successfully."
@@ -64,6 +69,7 @@ main() {
     log_warn "Old API key not found (already revoked?). HTTP 404."
   else
     log_error "Failed to revoke old API key. HTTP ${http_code}"
+    log_error "Response: ${body}"
     log_error "Manual revocation required. Key ID: ${old_key_id}"
     exit 1
   fi

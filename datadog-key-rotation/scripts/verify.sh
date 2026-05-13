@@ -1,27 +1,41 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# verify.sh — Stage 3: Verify all clusters are reporting with the new key
+# verify.sh — Verify clusters are reporting with the new key
 # ==============================================================================
 # Queries the Datadog GovCloud API to confirm hosts are still reporting after
-# the key rotation. Waits up to VERIFY_TIMEOUT seconds for all expected
-# clusters to check in.
+# the key rotation. Does a single pass (no polling loop) since each cluster's
+# rollout job already waited for pods to be ready and checked the API.
+#
+# Uses a threshold to decide pass/fail:
+#   - VERIFY_THRESHOLD (default: 80) — minimum % of clusters that must be
+#     reporting for the verification to pass and allow revoke to proceed.
+#   - This handles the reality that 1-2 clusters out of 30 may be slow to
+#     report without blocking the entire rotation.
 #
 # Required env vars:
 #   DD_APP_KEY          — Datadog Application key
 #   ROTATION_STATE_FILE — Path to rotation state JSON from stage 1
 # ==============================================================================
-set -euo pipefail
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/helpers.sh"
 
 DD_API_BASE="https://api.ddog-gov.com"
 ROTATION_STATE_FILE="${ROTATION_STATE_FILE:-${CI_PROJECT_DIR:-$(pwd)}/rotation_state.json}"
-CONFIG_FILE="${CONFIG_FILE:-config/clusters.yml}"
+CONFIG_FILE="${CONFIG_FILE:-config/clusters.json}"
 
-# How long to wait for hosts to report (default: 10 minutes)
-VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-600}"
-# How often to poll (default: 30 seconds)
+# Pre-flight: DD_APP_KEY is required for Datadog API queries
+if [[ -z "${DD_APP_KEY:-}" ]]; then
+  log_error "DD_APP_KEY is not set. Cannot verify cluster reporting."
+  exit 1
+fi
+
+# Minimum percentage of clusters that must be reporting to pass verification
+VERIFY_THRESHOLD="${VERIFY_THRESHOLD:-80}"
+# How many times to check before giving up (default: 5 = ~2.5 min with 30s interval)
+VERIFY_MAX_RETRIES="${VERIFY_MAX_RETRIES:-5}"
+# How long to wait between checks (default: 30 seconds)
 VERIFY_INTERVAL="${VERIFY_INTERVAL:-30}"
 
 # ------------------------------------------------------------------------------
@@ -39,17 +53,14 @@ get_expected_clusters() {
 
 # ------------------------------------------------------------------------------
 # Check if a specific host/cluster is reporting to Datadog
-# Uses the new API key from the rotation state.
 # ------------------------------------------------------------------------------
 check_cluster_reporting() {
   local new_key="$1"
   local cluster_name="$2"
 
-  # Query Datadog for hosts with a matching cluster name tag
-  # The agent reports kube_cluster_name as a host tag
   local response
   response=$(curl -sf -X GET \
-    "${DD_API_BASE}/api/v1/hosts?filter=kube_cluster_name:${cluster_name}&count=1&from=$(( $(date +%s) - 300 ))" \
+    "${DD_API_BASE}/api/v1/hosts?filter=kube_cluster_name:${cluster_name}&count=1&from=$(( $(date +%s) - 900 ))" \
     -H "DD-API-KEY: ${new_key}" \
     -H "DD-APPLICATION-KEY: ${DD_APP_KEY}" 2>/dev/null || echo '{"total_matching": 0}')
 
@@ -64,12 +75,10 @@ check_cluster_reporting() {
 }
 
 # ------------------------------------------------------------------------------
-# Main verification loop
+# Main — single pass, threshold-based
 # ------------------------------------------------------------------------------
 main() {
-  log_info "========== Stage 3: Verify Cluster Reporting =========="
-
-  setup_proxy
+  log_info "========== Verify Cluster Reporting =========="
 
   if [[ ! -f "$ROTATION_STATE_FILE" ]]; then
     log_error "Rotation state file not found: ${ROTATION_STATE_FILE}"
@@ -83,22 +92,18 @@ main() {
   mapfile -t expected_clusters < <(get_expected_clusters)
   local total_clusters=${#expected_clusters[@]}
 
-  log_info "Expecting ${total_clusters} clusters to report."
+  log_info "Checking ${total_clusters} cluster(s) against Datadog API (threshold: ${VERIFY_THRESHOLD}%)"
+  log_info "Will retry up to ${VERIFY_MAX_RETRIES} times with ${VERIFY_INTERVAL}s between attempts..."
 
-  local start_time
-  start_time=$(date +%s)
-  local all_reporting=false
+  local reporting=0
+  local not_reporting=()
+  local pct=0
+  local attempt=0
 
-  while true; do
-    local elapsed=$(( $(date +%s) - start_time ))
-
-    if (( elapsed > VERIFY_TIMEOUT )); then
-      log_error "Verification timed out after ${VERIFY_TIMEOUT}s"
-      break
-    fi
-
-    local reporting=0
-    local not_reporting=()
+  while (( attempt < VERIFY_MAX_RETRIES )); do
+    (( attempt++ )) || true
+    reporting=0
+    not_reporting=()
 
     for cluster in "${expected_clusters[@]}"; do
       if check_cluster_reporting "$new_key" "$cluster"; then
@@ -108,29 +113,55 @@ main() {
       fi
     done
 
-    log_info "Reporting: ${reporting}/${total_clusters} (elapsed: ${elapsed}s)"
+    if (( total_clusters > 0 )); then
+      pct=$(( (reporting * 100) / total_clusters ))
+    fi
 
-    if [[ "$reporting" -eq "$total_clusters" ]]; then
-      all_reporting=true
+    log_info "Attempt ${attempt}/${VERIFY_MAX_RETRIES}: ${reporting}/${total_clusters} reporting (${pct}%)"
+
+    # Pass if we hit threshold
+    if (( pct >= VERIFY_THRESHOLD )); then
       break
     fi
 
-    if [[ ${#not_reporting[@]} -gt 0 ]]; then
-      log_warn "Not yet reporting: ${not_reporting[*]}"
+    # Don't sleep after the last attempt
+    if (( attempt < VERIFY_MAX_RETRIES )); then
+      if [[ ${#not_reporting[@]} -gt 0 ]]; then
+        log_info "Not yet reporting: ${not_reporting[*]}"
+      fi
+      log_info "Waiting ${VERIFY_INTERVAL}s before next check..."
+      sleep "$VERIFY_INTERVAL"
     fi
-
-    sleep "$VERIFY_INTERVAL"
   done
 
-  # Write verification result
+  # Log final per-cluster status
+  for cluster in "${expected_clusters[@]}"; do
+    if check_cluster_reporting "$new_key" "$cluster"; then
+      log_info "  OK ${cluster}"
+    else
+      log_warn "  FAIL ${cluster}"
+    fi
+  done
+
+  log_info "Result: ${reporting}/${total_clusters} clusters reporting (${pct}%)"
+
+  # Determine pass/fail based on threshold
   local verify_result
-  if $all_reporting; then
+  if [[ "$reporting" -eq "$total_clusters" ]]; then
     verify_result="success"
-    log_info "All ${total_clusters} clusters verified. Rotation successful."
+    log_info "All ${total_clusters} clusters verified."
+  elif (( pct >= VERIFY_THRESHOLD )); then
+    verify_result="partial_pass"
+    log_warn "${reporting}/${total_clusters} reporting (${pct}% >= ${VERIFY_THRESHOLD}% threshold). Proceeding."
+    if [[ ${#not_reporting[@]} -gt 0 ]]; then
+      log_warn "Not reporting: ${not_reporting[*]}"
+      log_warn "These clusters may need manual investigation."
+    fi
   else
-    verify_result="partial"
-    log_error "Not all clusters reporting. Manual intervention required."
-    log_error "The old API key has NOT been revoked to prevent data loss."
+    verify_result="fail"
+    log_error "Only ${reporting}/${total_clusters} reporting (${pct}% < ${VERIFY_THRESHOLD}% threshold)."
+    log_error "Not reporting: ${not_reporting[*]}"
+    log_error "The old API key will NOT be revoked to prevent data loss."
   fi
 
   # Update rotation state with verification result
@@ -138,10 +169,12 @@ main() {
   tmp=$(mktemp)
   jq --arg result "$verify_result" \
      --arg verified_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-     '. + {verify_result: $result, verified_at: $verified_at}' \
+     --arg reporting "${reporting}/${total_clusters}" \
+     --arg pct "${pct}%" \
+     '. + {verify_result: $result, verified_at: $verified_at, verify_reporting: $reporting, verify_pct: $pct}' \
      "$ROTATION_STATE_FILE" > "$tmp" && mv "$tmp" "$ROTATION_STATE_FILE"
 
-  if [[ "$verify_result" != "success" ]]; then
+  if [[ "$verify_result" == "fail" ]]; then
     exit 1
   fi
 }

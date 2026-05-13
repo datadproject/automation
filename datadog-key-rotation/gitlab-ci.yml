@@ -1,0 +1,231 @@
+# ==============================================================================
+# .gitlab-ci.yml — Datadog API Key Rotation Pipeline
+# ==============================================================================
+# Rotates one environment's Datadog API key per pipeline run.
+# DD_ENV controls which environment is rotated (set in the schedule or manually).
+#
+# Stages:
+#   1. rotate   — Read current key from Secrets Manager, create new key, store it
+#   2. generate — Build dynamic child pipeline YAML for parallel cluster rollout
+#   3. rollout  — (child pipeline) Update K8s secrets + restart agents, per cluster
+#   4. revoke   — Delete the old Datadog API key (after rollout succeeds)
+#
+# Required GitLab CI Protected Variables (Settings > CI/CD > Variables):
+#   HUB_ACCOUNT_ROLE_ARN   — ARN of DatadogRotationRole (from infra-pipeline output)
+#   HUB_ACCOUNT_REGION     — us-gov-west-1
+#   DD_APP_KEY             — Datadog App key (api_keys_read + api_keys_write scopes)
+#
+# Required per-schedule variable (set in each schedule definition):
+#   DD_ENV                 — lower | ist | uat | ept | stage | prod
+#
+# Optional runtime variables:
+#   CLUSTER_FILTER         — "" (all) | "name1,name2" | "tag:prod" | "tag:wave-1+prod"
+#   ROLLOUT_ONLY           — "true" = push current key to clusters (no new key created)
+#   DRY_RUN                — "true" = validate connectivity only, no changes
+#   FORCE_ROTATION         — "true" = trigger rotation outside of schedule
+# ==============================================================================
+
+stages:
+  - rotate
+  - generate
+  - rollout
+  - revoke
+
+variables:
+  GIT_STRATEGY: clone
+  GIT_SSL_NO_VERIFY: "true"
+  CONFIG_FILE: config/clusters.json
+  HUB_ACCOUNT_REGION: "us-gov-west-1"
+  ROLLOUT_TIMEOUT: "300s"
+  # ---------------------------------------------------------------------------
+  # Cluster targeting — set when triggering manually to target a subset.
+  #   ""  or "all"                           — All clusters (default)
+  #   "prod-us-gov-west-1-fps"              — Single cluster by name
+  #   "prod-us-gov-west-1-fps,prod-data"    — Multiple by name
+  #   "tag:prod"                            — All clusters tagged "prod"
+  #   "tag:wave-1"                          — Wave 1 clusters only
+  #   "tag:prod+us-gov-west-1"              — Clusters with BOTH tags (AND)
+  # ---------------------------------------------------------------------------
+  CLUSTER_FILTER: ""
+  ROLLOUT_ONLY: "false"
+  DRY_RUN: "false"
+  FORCE_ROTATION: "false"
+
+# ---------------------------------------------------------------------------
+# Shell executor runner — aws, kubectl, jq pre-installed on runner host
+# ---------------------------------------------------------------------------
+.common: &common
+  tags:
+    - EKS_RUNNER_GITLAB
+
+.default-auth:
+  <<: *common
+  before_script:
+    - source scripts/helpers.sh
+
+# ===========================================================================
+# Stage 1a: rotate — Read from Secrets Manager, create new DD key, store back
+#
+# Skipped when ROLLOUT_ONLY=true (existing key is used as-is)
+# ===========================================================================
+rotate-api-key:
+  extends: .default-auth
+  stage: rotate
+  script:
+    - bash scripts/rotate_key.sh
+  artifacts:
+    paths:
+      - rotation_state.json
+    expire_in: 1 day
+  rules:
+    - if: '$ROLLOUT_ONLY == "true"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$FORCE_ROTATION == "true"'
+
+# ===========================================================================
+# Stage 1b: prepare-rollout-only — Read current key from Secrets Manager
+# and create a rotation_state.json without creating a new key.
+#
+# Use case: re-push current key to failed/new clusters after a partial rollout.
+# ===========================================================================
+prepare-rollout-only:
+  extends: .default-auth
+  stage: rotate
+  script:
+    - |
+      source scripts/helpers.sh
+      log_info "ROLLOUT_ONLY mode — reading current key from Secrets Manager"
+      log_info "DD_ENV: ${DD_ENV}, CLUSTER_FILTER: ${CLUSTER_FILTER:-all}"
+
+      if [[ -z "${HUB_ACCOUNT_ROLE_ARN:-}" ]]; then
+        log_error "HUB_ACCOUNT_ROLE_ARN is not set."
+        exit 1
+      fi
+
+      if [[ -z "${DD_ENV:-}" ]]; then
+        log_error "DD_ENV is not set. Set it in the pipeline schedule or as a variable."
+        exit 1
+      fi
+
+      # Assume hub role and read current key from Secrets Manager
+      read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<< \
+        "$(aws sts assume-role \
+          --role-arn "${HUB_ACCOUNT_ROLE_ARN}" \
+          --role-session-name "dd-rollout-only-${DD_ENV}-${CI_PIPELINE_ID:-manual}" \
+          --external-id "datadog-rotation-pipeline" \
+          --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+          --output text)"
+      export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+      CURRENT_KEY=$(aws secretsmanager get-secret-value \
+        --secret-id "datadog/${DD_ENV}/api-key" \
+        --region "${HUB_ACCOUNT_REGION}" \
+        --query 'SecretString' \
+        --output text)
+
+      if [[ -z "$CURRENT_KEY" || "$CURRENT_KEY" == "None" ]]; then
+        log_error "Could not read key from Secrets Manager for env: ${DD_ENV}"
+        exit 1
+      fi
+
+      log_info "Current key read (last4: ${CURRENT_KEY: -4})"
+      unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+      jq -n \
+        --arg env         "${DD_ENV}" \
+        --arg new_key     "${CURRENT_KEY}" \
+        --arg mode        "rollout_only" \
+        --arg filter      "${CLUSTER_FILTER:-all}" \
+        --arg pipeline_id "${CI_PIPELINE_ID:-manual}" \
+        --arg created_at  "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        '{
+          env:           $env,
+          new_key:       $new_key,
+          new_key_id:    "existing",
+          old_key_id:    "n/a",
+          old_key_last4: "n/a",
+          rotated_at:    $created_at,
+          pipeline_id:   $pipeline_id,
+          mode:          $mode,
+          cluster_filter: $filter
+        }' > rotation_state.json
+
+      log_info "rotation_state.json written for rollout-only mode."
+  artifacts:
+    paths:
+      - rotation_state.json
+    expire_in: 1 day
+  rules:
+    - if: '$ROLLOUT_ONLY == "true"'
+
+# ===========================================================================
+# Stage 2: generate — Build child pipeline YAML for parallel cluster rollout
+# Reads rotation_state.json and config/clusters.json to generate
+# one job per cluster, with the new API key baked in.
+# ===========================================================================
+generate-rollout-matrix:
+  extends: .default-auth
+  stage: generate
+  script:
+    - bash scripts/generate_matrix.sh
+  artifacts:
+    paths:
+      - child-pipeline.yml
+      - rotation_state.json
+      - cluster_matrix.txt
+    expire_in: 1 day
+  rules:
+    - if: '$ROLLOUT_ONLY == "true"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$FORCE_ROTATION == "true"'
+
+# ===========================================================================
+# Stage 3: rollout — Trigger the child pipeline (one job per cluster, parallel)
+# ===========================================================================
+rollout-clusters:
+  stage: rollout
+  trigger:
+    include:
+      - artifact: child-pipeline.yml
+        job: generate-rollout-matrix
+    strategy: depend
+  needs:
+    - job: generate-rollout-matrix
+      artifacts: true
+  rules:
+    - if: '$ROLLOUT_ONLY == "true"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$FORCE_ROTATION == "true"'
+
+# ===========================================================================
+# Stage 4: revoke — Delete the old Datadog API key from Datadog
+#
+# Runs automatically after rollout succeeds (no verify gate).
+# Skipped in ROLLOUT_ONLY mode (no new key was created, nothing to revoke).
+#
+# The new key (now active in Secrets Manager and all clusters) is used to
+# authenticate the delete call for the old key.
+# ===========================================================================
+revoke-old-key:
+  extends: .default-auth
+  stage: revoke
+  script:
+    - bash scripts/revoke_old_key.sh
+  artifacts:
+    paths:
+      - rotation_state.json
+    expire_in: 30 days
+  needs:
+    - job: rollout-clusters
+    - job: generate-rollout-matrix
+      artifacts: true
+  rules:
+    - if: '$ROLLOUT_ONLY == "true"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$FORCE_ROTATION == "true"'
