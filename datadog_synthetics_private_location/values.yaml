@@ -1,0 +1,38 @@
+# Datadog Synthetics Private Location Helm values
+# Chart: datadog/synthetics-private-location
+#
+# The Datadog-generated worker configuration JSON is intentionally NOT stored
+# in this file. It is uploaded to GitLab Project-level Secure Files as
+# 'synthetics-check-runner.json', downloaded by the pipeline, used to create a
+# Kubernetes Secret, then deleted from the runner.
+
+replicaCount: 2
+
+image:
+  repository: gcr.io/datadoghq/synthetics-private-location-worker
+  pullPolicy: IfNotPresent
+  tag: "1.68.0"
+
+# The pipeline creates this Kubernetes Secret BEFORE running 'helm upgrade'.
+# It must contain a data key named exactly: synthetics-check-runner.json
+configSecret: datadog-synthetics-private-location-config
+
+dnsPolicy: ClusterFirst
+
+# Keep this false unless the Datadog-generated worker JSON is also updated
+# with "enableStatusProbes": true. The two settings must stay in sync.
+enableStatusProbes: false
+
+# Intentionally unset until API-test vs browser-test concurrency and node
+# capacity are confirmed. Set requests/limits in a follow-up change.
+resources: {}
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Optional: uncomment after node-group layout is confirmed.
+# nodeSelector:
+#   kubernetes.io/arch: amd64
+
+affinity: {}

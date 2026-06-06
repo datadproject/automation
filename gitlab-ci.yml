@@ -1,0 +1,214 @@
+stages:
+  - k8s-deploy
+  - checks
+  - cleanup
+
+variables:
+  TF_ROOT: ${CI_PROJECT_DIR}
+  GIT_STRATEGY: clone
+  GIT_SSL_NO_VERIFY: "true"
+
+.common: &common
+  tags:
+    - EKS_RUNNER_GITLAB
+
+.default-cluster-auth:
+  <<: *common
+  before_script:
+    # set proxy if needed
+    - export HTTPS_PROXY=10.111.225.254:8080
+    - export NO_PROXY=".sk1.us-gov-west-1.eks.amazonaws.com"
+
+    # get cluster & account info
+    - export CLUSTER_NAME=NGDC-FPS-EKS-cluster
+    - export AWS_ACCOUNT=093737011827
+
+    ## assume the Admin role exactly once
+    - |
+      read AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<< \
+        $(aws sts assume-role \
+          --role-arn arn:aws-us-gov:iam::${AWS_ACCOUNT}:role/NGDCGitLabTerraformAdminRole \
+          --role-session-name gitlab-ci \
+          --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+          --output text)
+    - export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+    # sanity-check
+    - aws sts get-caller-identity
+
+    # now update kubeconfig (uses the assumed creds)
+    - aws eks update-kubeconfig --name="${CLUSTER_NAME}" --region=us-gov-west-1
+
+# Now your real jobs just extend that template
+kubectl-get-pods:
+  extends: .default-cluster-auth
+  when: manual
+  stage: checks
+  script:
+    - cat /proc/net/dev
+    - kubectl get pods -A -o wide
+  variables:
+    ENV_NAME: cnc
+
+kubectl-get-nodes:
+  extends: .default-cluster-auth
+  when: manual
+  stage: checks
+  script:
+    - cat /proc/net/dev
+    - kubectl get nodes
+  variables:
+    ENV_NAME: cnc
+
+# 1) Check overall cluster status
+aws-check-cluster-status:
+  extends: .default-cluster-auth
+  when: manual
+  stage: checks
+  script:
+    - echo "Cluster status:"
+    - aws eks describe-cluster --name "${CLUSTER_NAME}" --region us-gov-west-1 --query "cluster.status"
+    - aws eks describe-cluster --name "${CLUSTER_NAME}" --region us-gov-west-1 --query "cluster.identity.oidc.issuer"
+  variables:
+    ENV_NAME: cnc
+
+# 2) List all node-groups
+aws-list-nodegroups:
+  extends: .default-cluster-auth
+  when: manual
+  stage: checks
+  script:
+    - echo "Node groups:"
+    - aws eks list-nodegroups --cluster-name "${CLUSTER_NAME}" --region us-gov-west-1
+  variables:
+    ENV_NAME: cnc
+
+# -----------------------------------------------------------------------------
+# Datadog Synthetics Private Location worker
+# Separate Helm release from the existing Datadog Operator / DatadogAgent.
+# Chart:      datadog/synthetics-private-location  (NOT datadog/datadog-private-location)
+# Namespace:  datadog-synthetics  (dedicated; isolates from the Operator namespace)
+# Release:    datadog-synthetics-private-location
+# Secret:     datadog-synthetics-private-location-config
+# The worker config JSON is uploaded to GitLab project Secure Files as
+# synthetics-check-runner.json and is never committed to Git.
+# -----------------------------------------------------------------------------
+
+.dd-pl-vars: &dd-pl-vars
+  ENV_NAME: cnc
+  DD_NAMESPACE: datadog-synthetics
+  DD_RELEASE_NAME: datadog-synthetics-private-location
+  DD_CONFIG_SECRET_NAME: datadog-synthetics-private-location-config
+  DD_SECURE_FILE_NAME: synthetics-check-runner.json
+  DD_SECURE_FILE_PATH: .secure_files/synthetics-check-runner.json
+  DD_WORKER_VALUES: datadog_synthetics_private_location/values.yaml
+
+check-datadog-private-location-prereqs:
+  extends: .default-cluster-auth
+  when: manual
+  stage: checks
+  variables:
+    <<: *dd-pl-vars
+  script:
+    - command -v aws
+    - command -v kubectl
+    - command -v helm
+    - command -v jq
+    - |
+      if ! command -v glab >/dev/null 2>&1; then
+        echo "ERROR: 'glab' is missing from the approved runner image."
+        echo "Update the runner tooling image to include glab. Do not install glab dynamically in pipelines."
+        exit 1
+      fi
+    - kubectl get nodes
+    - glab auth login --hostname "${CI_SERVER_FQDN}" --job-token "${CI_JOB_TOKEN}"
+    - glab securefile list
+    # Confirm the required Secure File exists without printing its contents.
+    - |
+      if ! glab securefile list | grep -F -q "${DD_SECURE_FILE_NAME}"; then
+        echo "ERROR: Required Secure File '${DD_SECURE_FILE_NAME}' is not present at project level."
+        exit 1
+      fi
+    - echo "Secure File '${DD_SECURE_FILE_NAME}' is present."
+
+helm-deploy-datadog-private-location:
+  extends: .default-cluster-auth
+  when: manual
+  stage: k8s-deploy
+  variables:
+    <<: *dd-pl-vars
+  script:
+    - helm repo add datadog https://helm.datadoghq.com
+    - helm repo update
+    - kubectl create namespace "${DD_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+    - |
+      set +x
+      umask 077
+      mkdir -p .secure_files
+
+      glab auth login \
+        --hostname "${CI_SERVER_FQDN}" \
+        --job-token "${CI_JOB_TOKEN}"
+
+      glab securefile download \
+        --name "${DD_SECURE_FILE_NAME}" \
+        --path "${DD_SECURE_FILE_PATH}"
+
+      test -s "${DD_SECURE_FILE_PATH}"
+
+      kubectl create secret generic "${DD_CONFIG_SECRET_NAME}" \
+        --namespace "${DD_NAMESPACE}" \
+        --from-file=synthetics-check-runner.json="${DD_SECURE_FILE_PATH}" \
+        --dry-run=client \
+        -o yaml |
+        kubectl apply -f -
+
+      rm -f "${DD_SECURE_FILE_PATH}"
+    - |
+      helm upgrade --install "${DD_RELEASE_NAME}" \
+        datadog/synthetics-private-location \
+        --namespace "${DD_NAMESPACE}" \
+        --values "${DD_WORKER_VALUES}" \
+        --atomic \
+        --wait \
+        --timeout 10m
+    - helm list --namespace "${DD_NAMESPACE}"
+    - kubectl get deployments,pods,pdb --namespace "${DD_NAMESPACE}" -o wide
+  after_script:
+    # Always remove any temporary secure-file material, even on failure.
+    - rm -rf .secure_files
+
+check-datadog-private-location-status:
+  extends: .default-cluster-auth
+  when: manual
+  stage: checks
+  variables:
+    <<: *dd-pl-vars
+  script:
+    - helm status "${DD_RELEASE_NAME}" --namespace "${DD_NAMESPACE}"
+    - kubectl get deployments,pods,pdb --namespace "${DD_NAMESPACE}" -o wide
+    # Confirm the required key is present in the Secret WITHOUT exposing its value.
+    - |
+      kubectl get secret "${DD_CONFIG_SECRET_NAME}" \
+        --namespace "${DD_NAMESPACE}" \
+        -o jsonpath='{.data}' |
+        jq 'keys'
+    - |
+      kubectl logs \
+        --namespace "${DD_NAMESPACE}" \
+        --selector="app.kubernetes.io/instance=${DD_RELEASE_NAME}" \
+        --tail=100 \
+        --prefix
+
+cleanup-datadog-private-location:
+  extends: .default-cluster-auth
+  when: manual
+  stage: cleanup
+  variables:
+    <<: *dd-pl-vars
+  script:
+    # Removes ONLY the synthetics private-location release and its config Secret.
+    # Does NOT touch: the Datadog Operator, DatadogAgent CR, datadog-secret,
+    # or any resource in the 'datadog' namespace.
+    - helm uninstall "${DD_RELEASE_NAME}" --namespace "${DD_NAMESPACE}" || true
+    - kubectl delete secret "${DD_CONFIG_SECRET_NAME}" --namespace "${DD_NAMESPACE}" --ignore-not-found
