@@ -114,22 +114,22 @@ check-datadog-private-location-prereqs:
     - command -v kubectl
     - command -v helm
     - command -v jq
-    - |
-      if ! command -v glab >/dev/null 2>&1; then
-        echo "ERROR: 'glab' is missing from the approved runner image."
-        echo "Update the runner tooling image to include glab. Do not install glab dynamically in pipelines."
-        exit 1
-      fi
+    - command -v curl
     - kubectl get nodes
-    - glab auth login --hostname "${CI_SERVER_FQDN}" --job-token "${CI_JOB_TOKEN}"
-    - glab securefile list
-    # Confirm the required Secure File exists without printing its contents.
+    # Confirm the required Secure File exists via the GitLab REST API.
+    # Does NOT download it; does NOT print its contents.
     - |
-      if ! glab securefile list | grep -F -q "${DD_SECURE_FILE_NAME}"; then
+      set +x
+      SECURE_FILE_ID=$(curl -sS --fail \
+        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/secure_files" \
+        | jq -r --arg n "${DD_SECURE_FILE_NAME}" '.[] | select(.name==$n) | .id' | head -n1)
+      if [ -z "${SECURE_FILE_ID}" ]; then
         echo "ERROR: Required Secure File '${DD_SECURE_FILE_NAME}' is not present at project level."
+        echo "Upload it under Project Settings > CI/CD > Secure Files with the exact filename: ${DD_SECURE_FILE_NAME}"
         exit 1
       fi
-    - echo "Secure File '${DD_SECURE_FILE_NAME}' is present."
+      echo "Secure File '${DD_SECURE_FILE_NAME}' is present."
 
 helm-deploy-datadog-private-location:
   extends: .default-cluster-auth
@@ -146,13 +146,16 @@ helm-deploy-datadog-private-location:
       umask 077
       mkdir -p .secure_files
 
-      glab auth login \
-        --hostname "${CI_SERVER_FQDN}" \
-        --job-token "${CI_JOB_TOKEN}"
+      SECURE_FILE_ID=$(curl -sS --fail \
+        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/secure_files" \
+        | jq -r --arg n "${DD_SECURE_FILE_NAME}" '.[] | select(.name==$n) | .id' | head -n1)
+      test -n "${SECURE_FILE_ID}"
 
-      glab securefile download \
-        --name "${DD_SECURE_FILE_NAME}" \
-        --path "${DD_SECURE_FILE_PATH}"
+      curl -sS --fail \
+        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        --output "${DD_SECURE_FILE_PATH}" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/secure_files/${SECURE_FILE_ID}/download"
 
       test -s "${DD_SECURE_FILE_PATH}"
 
