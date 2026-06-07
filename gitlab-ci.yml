@@ -89,9 +89,12 @@ aws-list-nodegroups:
 # Chart:      datadog/synthetics-private-location  (NOT datadog/datadog-private-location)
 # Namespace:  datadog-synthetics  (dedicated; isolates from the Operator namespace)
 # Release:    datadog-synthetics-private-location
-# Secret:     datadog-synthetics-private-location-config
-# The worker config JSON is uploaded to GitLab project Secure Files as
-# synthetics-check-runner.json and is never committed to Git.
+# K8s Secret: datadog-synthetics-private-location-config
+# JSON source: AWS Secrets Manager (us-gov-west-1).
+#   - Secret name (DD_AWS_SECRET_ID below) must already exist with the entire
+#     synthetics-check-runner.json content as the SecretString.
+#   - Read access is granted to NGDCGitLabTerraformAdminRole.
+# The JSON is never committed to Git and never written under ${CI_PROJECT_DIR}.
 # -----------------------------------------------------------------------------
 
 .dd-pl-vars: &dd-pl-vars
@@ -99,9 +102,13 @@ aws-list-nodegroups:
   DD_NAMESPACE: datadog-synthetics
   DD_RELEASE_NAME: datadog-synthetics-private-location
   DD_CONFIG_SECRET_NAME: datadog-synthetics-private-location-config
-  DD_SECURE_FILE_NAME: synthetics-check-runner.json
-  DD_SECURE_FILE_PATH: .secure_files/synthetics-check-runner.json
   DD_WORKER_VALUES: datadog_synthetics_private_location/values.yaml
+  # The worker JSON is stored in AWS Secrets Manager and fetched at deploy time
+  # using the role already assumed by .default-cluster-auth.
+  # DD_AWS_SECRET_ID is the AWS Secrets Manager secret name or full ARN.
+  # The SecretString must be the entire synthetics-check-runner.json contents.
+  DD_AWS_SECRET_ID: datadog/synthetics/private-location-runner-json
+  DD_TMP_JSON_PATH: /tmp/synthetics-check-runner.${CI_JOB_ID}.json
 
 check-datadog-private-location-prereqs:
   extends: .default-cluster-auth
@@ -114,22 +121,16 @@ check-datadog-private-location-prereqs:
     - command -v kubectl
     - command -v helm
     - command -v jq
-    - command -v curl
     - kubectl get nodes
-    # Confirm the required Secure File exists via the GitLab REST API.
-    # Does NOT download it; does NOT print its contents.
+    # Confirm the AWS Secrets Manager secret exists and is accessible to the
+    # assumed role. describe-secret returns metadata only, NOT the value.
     - |
-      set +x
-      SECURE_FILE_ID=$(curl -sS --fail \
-        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
-        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/secure_files" \
-        | jq -r --arg n "${DD_SECURE_FILE_NAME}" '.[] | select(.name==$n) | .id' | head -n1)
-      if [ -z "${SECURE_FILE_ID}" ]; then
-        echo "ERROR: Required Secure File '${DD_SECURE_FILE_NAME}' is not present at project level."
-        echo "Upload it under Project Settings > CI/CD > Secure Files with the exact filename: ${DD_SECURE_FILE_NAME}"
-        exit 1
-      fi
-      echo "Secure File '${DD_SECURE_FILE_NAME}' is present."
+      aws secretsmanager describe-secret \
+        --secret-id "${DD_AWS_SECRET_ID}" \
+        --region "${AWS_REGION:-us-gov-west-1}" \
+        --query '{Name:Name,ARN:ARN,LastChangedDate:LastChangedDate}' \
+        --output table
+      echo "AWS Secrets Manager secret '${DD_AWS_SECRET_ID}' is accessible."
 
 helm-deploy-datadog-private-location:
   extends: .default-cluster-auth
@@ -144,29 +145,25 @@ helm-deploy-datadog-private-location:
     - |
       set +x
       umask 077
-      mkdir -p .secure_files
 
-      SECURE_FILE_ID=$(curl -sS --fail \
-        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
-        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/secure_files" \
-        | jq -r --arg n "${DD_SECURE_FILE_NAME}" '.[] | select(.name==$n) | .id' | head -n1)
-      test -n "${SECURE_FILE_ID}"
-
-      curl -sS --fail \
-        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
-        --output "${DD_SECURE_FILE_PATH}" \
-        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/secure_files/${SECURE_FILE_ID}/download"
-
-      test -s "${DD_SECURE_FILE_PATH}"
+      # Pull the worker JSON from AWS Secrets Manager into a job-scoped temp file.
+      # --output text writes the raw SecretString; redirection keeps it out of logs.
+      aws secretsmanager get-secret-value \
+        --secret-id "${DD_AWS_SECRET_ID}" \
+        --region "${AWS_REGION:-us-gov-west-1}" \
+        --query SecretString \
+        --output text > "${DD_TMP_JSON_PATH}"
+      chmod 600 "${DD_TMP_JSON_PATH}"
+      test -s "${DD_TMP_JSON_PATH}"
 
       kubectl create secret generic "${DD_CONFIG_SECRET_NAME}" \
         --namespace "${DD_NAMESPACE}" \
-        --from-file=synthetics-check-runner.json="${DD_SECURE_FILE_PATH}" \
+        --from-file=synthetics-check-runner.json="${DD_TMP_JSON_PATH}" \
         --dry-run=client \
         -o yaml |
         kubectl apply -f -
 
-      rm -f "${DD_SECURE_FILE_PATH}"
+      shred -u "${DD_TMP_JSON_PATH}" 2>/dev/null || rm -f "${DD_TMP_JSON_PATH}"
     - |
       helm upgrade --install "${DD_RELEASE_NAME}" \
         datadog/synthetics-private-location \
@@ -178,8 +175,8 @@ helm-deploy-datadog-private-location:
     - helm list --namespace "${DD_NAMESPACE}"
     - kubectl get deployments,pods,pdb --namespace "${DD_NAMESPACE}" -o wide
   after_script:
-    # Always remove any temporary secure-file material, even on failure.
-    - rm -rf .secure_files
+    # Always remove the temp JSON file, even on failure or early exit.
+    - rm -f "${DD_TMP_JSON_PATH}" || true
 
 check-datadog-private-location-status:
   extends: .default-cluster-auth

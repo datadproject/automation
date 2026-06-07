@@ -2,9 +2,5 @@
 synthetics-check-runner.json
 **/synthetics-check-runner.json
 
-# Pipeline temporary download directory.
-.secure_files/
-**/.secure_files/
-
 # Local rendered Helm output, if generated for troubleshooting.
 rendered*.yaml

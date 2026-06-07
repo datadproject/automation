@@ -2,9 +2,9 @@
 # Chart: datadog/synthetics-private-location
 #
 # The Datadog-generated worker configuration JSON is intentionally NOT stored
-# in this file. It is uploaded to GitLab Project-level Secure Files as
-# 'synthetics-check-runner.json', downloaded by the pipeline, used to create a
-# Kubernetes Secret, then deleted from the runner.
+# in this file. It lives in AWS Secrets Manager (us-gov-west-1) and is pulled
+# by the GitLab pipeline at deploy time, used to create a Kubernetes Secret,
+# then removed from the runner. See .gitlab-ci.yml for the deploy job.
 
 replicaCount: 2
 
