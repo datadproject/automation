@@ -1,0 +1,316 @@
+# .gitlab-ci.yml
+#
+# Cluster chart CI for perkins-deploy-helm-charts.
+#
+# What runs when:
+#   merge_request_event -> validate every chart (helm template + workload guard)
+#   push to main        -> validate + a "deploy" DAG, gated per-env by manual
+#                          approval. Per wave: dry-run -> apply, chained so
+#                          wave N+1's dry-run sees wave N's installed state.
+#
+# Auth model (matches the dd-operator pipeline pattern):
+#   Runner has baseline AWS creds (project-level CI vars). before_script
+#   calls `aws sts assume-role` to swap into NGDCGitLabTerraformAdminRole in
+#   the target account, then `aws eks update-kubeconfig`.
+#
+# Variables to set in GitLab:
+#
+# Project-level (protected + masked, baseline creds for the assume-role call):
+#   AWS_ACCESS_KEY_ID
+#   AWS_SECRET_ACCESS_KEY
+#
+# Per-environment, scoped to `dev` and `prod` (Settings -> CI/CD -> Variables):
+#   AWS_ACCOUNT_ID     <perkins dev account>   |   <perkins prod account>
+#   AWS_REGION         us-east-1               |   us-east-1
+#   EKS_CLUSTER_NAME   gorals-dev-primary-ekscluster | gorals-prod-primary-ekscluster
+#
+# Prereqs not managed here:
+#   - cert-manager + metrics-server: EKS add-ons via perkins-infra
+#   - Datadog secret `datadog/datadog`: out-of-band before first install
+#   - NGDCGitLabTerraformAdminRole must exist in both perkins accounts and
+#     trust the baseline AWS_ACCESS_KEY_ID principal for sts:AssumeRole.
+
+variables:
+  HELM_IMAGE: alpine/k8s:1.30.4
+  HELM_TIMEOUT: 10m
+
+stages:
+  - validate
+  - approve-dev
+  - deploy-dev
+  - approve-prod
+  - deploy-prod
+
+# ----------------------------------------------------------------------
+# matrix: keep in sync with charts/cluster/clusterCharts.yaml
+# GitLab matrix values are static at pipeline-compile time, so the
+# manifest can't be read here. Update both files when charts change.
+# ----------------------------------------------------------------------
+
+.matrix-wave-0: &matrix-wave-0
+  - { RELEASE: istio-crds,            DIR: istio-crds,            NAMESPACE: istio-system, DEPS: "yes" }
+.matrix-wave-1: &matrix-wave-1
+  - { RELEASE: karpenter,             DIR: karpenter,             NAMESPACE: karpenter,    DEPS: "yes" }
+  - { RELEASE: istiod,                DIR: istiod,                NAMESPACE: istio-system, DEPS: "yes" }
+  - { RELEASE: datadog,               DIR: datadog-agent,         NAMESPACE: datadog,      DEPS: "yes" }
+  - { RELEASE: nodelocal-dns,         DIR: nodelocal-dns,         NAMESPACE: kube-system,  DEPS: "no"  }
+.matrix-wave-2: &matrix-wave-2
+  - { RELEASE: istio-gateway,         DIR: istio-gateway,         NAMESPACE: istio-system, DEPS: "yes" }
+  - { RELEASE: pgbouncer,             DIR: pgbouncer,             NAMESPACE: pgbouncer,    DEPS: "no"  }
+.matrix-wave-3: &matrix-wave-3
+  - { RELEASE: istio-gateway-objects, DIR: istio-gateway-objects, NAMESPACE: istio-system, DEPS: "no"  }
+
+# ----------------------------------------------------------------------
+# shared
+# ----------------------------------------------------------------------
+
+.common: &common
+  tags:
+    - EKS_RUNNER_GITLAB
+  image: $HELM_IMAGE
+
+.aws-eks:
+  <<: *common
+  before_script:
+    - export CLUSTER_NAME="$EKS_CLUSTER_NAME"
+    - export AWS_ACCOUNT="$AWS_ACCOUNT_ID"
+
+    # assume the admin role exactly once
+    - |
+      read AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<< \
+        $(aws sts assume-role \
+            --role-arn arn:aws:iam::${AWS_ACCOUNT}:role/NGDCGitLabTerraformAdminRole \
+            --role-session-name gitlab-ci-${CI_JOB_ID} \
+            --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+            --output text)
+    - export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+    - aws sts get-caller-identity
+    - aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+.main-only:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ----------------------------------------------------------------------
+# validate: helm template + "rendered something" guard, both envs, MR + main
+# (no cluster access needed; runs without assume-role)
+# ----------------------------------------------------------------------
+
+.template:
+  <<: *common
+  stage: validate
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - CHART_DIR="charts/cluster/$DIR"
+    - if [ "$DEPS" = "yes" ]; then helm dependency build "$CHART_DIR"; fi
+    - |
+      for env in dev prod; do
+        VALUES_FILE="$CHART_DIR/values/$env/values.yaml"
+        [ -f "$VALUES_FILE" ] || { echo "skip $RELEASE ($env): no values file"; continue; }
+        echo "=== template $RELEASE ($env) ==="
+        OUT="$(mktemp)"
+        helm template "$RELEASE" "$CHART_DIR" \
+          --namespace "$NAMESPACE" \
+          -f "$VALUES_FILE" > "$OUT"
+        COUNT=$(yq -e 'select(.kind != null) | .kind' "$OUT" 2>/dev/null | wc -l)
+        echo "  rendered $COUNT resources"
+        yq -e 'select(.kind != null) | [.kind, .metadata.namespace // "-", .metadata.name] | @tsv' "$OUT" 2>/dev/null || true
+        if [ "$COUNT" -eq 0 ]; then
+          echo "ERROR: $RELEASE ($env) rendered zero resources"; rm -f "$OUT"; exit 1
+        fi
+        rm -f "$OUT"
+      done
+
+template:wave-0: { extends: .template, parallel: { matrix: *matrix-wave-0 } }
+template:wave-1: { extends: .template, parallel: { matrix: *matrix-wave-1 } }
+template:wave-2: { extends: .template, parallel: { matrix: *matrix-wave-2 } }
+template:wave-3: { extends: .template, parallel: { matrix: *matrix-wave-3 } }
+
+# ----------------------------------------------------------------------
+# deploy primitives: dry-run + apply
+# ----------------------------------------------------------------------
+
+.helm-dry-run:
+  extends: [.aws-eks, .main-only]
+  script:
+    - CHART_DIR="charts/cluster/$DIR"
+    - VALUES_FILE="$CHART_DIR/values/$ENV/values.yaml"
+    - test -f "$VALUES_FILE" || { echo "missing $VALUES_FILE"; exit 1; }
+    - if [ "$DEPS" = "yes" ]; then helm dependency build "$CHART_DIR"; fi
+    - helm upgrade --install "$RELEASE" "$CHART_DIR"
+        --namespace "$NAMESPACE"
+        --create-namespace
+        -f "$VALUES_FILE"
+        --dry-run=server
+        --debug
+
+.helm-apply:
+  extends: [.aws-eks, .main-only]
+  script:
+    - CHART_DIR="charts/cluster/$DIR"
+    - VALUES_FILE="$CHART_DIR/values/$ENV/values.yaml"
+    - if [ "$DEPS" = "yes" ]; then helm dependency build "$CHART_DIR"; fi
+    - helm upgrade --install "$RELEASE" "$CHART_DIR"
+        --namespace "$NAMESPACE"
+        --create-namespace
+        -f "$VALUES_FILE"
+        --atomic
+        --timeout "$HELM_TIMEOUT"
+
+# ----------------------------------------------------------------------
+# dev: approve -> (dry-run -> apply) x wave 0..3
+# ----------------------------------------------------------------------
+
+approve:dev:
+  <<: *common
+  stage: approve-dev
+  extends: .main-only
+  environment: dev
+  when: manual
+  allow_failure: false
+  script: ['echo "dev deploy approved"']
+
+dry-run:dev:wave-0:
+  extends: .helm-dry-run
+  stage: deploy-dev
+  environment: dev
+  variables: { ENV: dev }
+  needs: ['approve:dev']
+  parallel: { matrix: *matrix-wave-0 }
+
+deploy:dev:wave-0:
+  extends: .helm-apply
+  stage: deploy-dev
+  environment: dev
+  variables: { ENV: dev }
+  needs: ['dry-run:dev:wave-0']
+  parallel: { matrix: *matrix-wave-0 }
+
+dry-run:dev:wave-1:
+  extends: .helm-dry-run
+  stage: deploy-dev
+  environment: dev
+  variables: { ENV: dev }
+  needs: ['deploy:dev:wave-0']
+  parallel: { matrix: *matrix-wave-1 }
+
+deploy:dev:wave-1:
+  extends: .helm-apply
+  stage: deploy-dev
+  environment: dev
+  variables: { ENV: dev }
+  needs: ['dry-run:dev:wave-1']
+  parallel: { matrix: *matrix-wave-1 }
+
+dry-run:dev:wave-2:
+  extends: .helm-dry-run
+  stage: deploy-dev
+  environment: dev
+  variables: { ENV: dev }
+  needs: ['deploy:dev:wave-1']
+  parallel: { matrix: *matrix-wave-2 }
+
+deploy:dev:wave-2:
+  extends: .helm-apply
+  stage: deploy-dev
+  environment: dev
+  variables: { ENV: dev }
+  needs: ['dry-run:dev:wave-2']
+  parallel: { matrix: *matrix-wave-2 }
+
+dry-run:dev:wave-3:
+  extends: .helm-dry-run
+  stage: deploy-dev
+  environment: dev
+  variables: { ENV: dev }
+  needs: ['deploy:dev:wave-2']
+  parallel: { matrix: *matrix-wave-3 }
+
+deploy:dev:wave-3:
+  extends: .helm-apply
+  stage: deploy-dev
+  environment: dev
+  variables: { ENV: dev }
+  needs: ['dry-run:dev:wave-3']
+  parallel: { matrix: *matrix-wave-3 }
+
+# ----------------------------------------------------------------------
+# prod: approve (gated on dev success) -> (dry-run -> apply) x wave 0..3
+# ----------------------------------------------------------------------
+
+approve:prod:
+  <<: *common
+  stage: approve-prod
+  extends: .main-only
+  environment: prod
+  when: manual
+  allow_failure: false
+  needs: ['deploy:dev:wave-3']
+  script: ['echo "prod deploy approved"']
+
+dry-run:prod:wave-0:
+  extends: .helm-dry-run
+  stage: deploy-prod
+  environment: prod
+  variables: { ENV: prod }
+  needs: ['approve:prod']
+  parallel: { matrix: *matrix-wave-0 }
+
+deploy:prod:wave-0:
+  extends: .helm-apply
+  stage: deploy-prod
+  environment: prod
+  variables: { ENV: prod }
+  needs: ['dry-run:prod:wave-0']
+  parallel: { matrix: *matrix-wave-0 }
+
+dry-run:prod:wave-1:
+  extends: .helm-dry-run
+  stage: deploy-prod
+  environment: prod
+  variables: { ENV: prod }
+  needs: ['deploy:prod:wave-0']
+  parallel: { matrix: *matrix-wave-1 }
+
+deploy:prod:wave-1:
+  extends: .helm-apply
+  stage: deploy-prod
+  environment: prod
+  variables: { ENV: prod }
+  needs: ['dry-run:prod:wave-1']
+  parallel: { matrix: *matrix-wave-1 }
+
+dry-run:prod:wave-2:
+  extends: .helm-dry-run
+  stage: deploy-prod
+  environment: prod
+  variables: { ENV: prod }
+  needs: ['deploy:prod:wave-1']
+  parallel: { matrix: *matrix-wave-2 }
+
+deploy:prod:wave-2:
+  extends: .helm-apply
+  stage: deploy-prod
+  environment: prod
+  variables: { ENV: prod }
+  needs: ['dry-run:prod:wave-2']
+  parallel: { matrix: *matrix-wave-2 }
+
+dry-run:prod:wave-3:
+  extends: .helm-dry-run
+  stage: deploy-prod
+  environment: prod
+  variables: { ENV: prod }
+  needs: ['deploy:prod:wave-2']
+  parallel: { matrix: *matrix-wave-3 }
+
+deploy:prod:wave-3:
+  extends: .helm-apply
+  stage: deploy-prod
+  environment: prod
+  variables: { ENV: prod }
+  needs: ['dry-run:prod:wave-3']
+  parallel: { matrix: *matrix-wave-3 }
