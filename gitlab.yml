@@ -124,7 +124,17 @@ stages:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   script:
     - CHART_DIR="charts/cluster/$DIR"
-    - if [ "$DEPS" = "yes" ]; then helm dependency build "$CHART_DIR"; fi
+    - |
+      if [ "$DEPS" = "yes" ]; then
+        # register any https Chart.yaml deps as helm repos (OCI deps need no repo-add)
+        yq -r '.dependencies // [] | .[] | select(.repository | test("^https?://")) | [.name, .repository] | @tsv' \
+          "$CHART_DIR/Chart.yaml" | \
+        while IFS=$'\t' read -r DEP_NAME DEP_URL; do
+          [ -n "$DEP_URL" ] && helm repo add "$DEP_NAME" "$DEP_URL" 2>/dev/null || true
+        done
+        helm repo update >/dev/null 2>&1 || true
+        helm dependency build "$CHART_DIR"
+      fi    
     - |
       for env in dev prod; do
         VALUES_FILE="$CHART_DIR/values/$env/values.yaml"
