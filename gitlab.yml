@@ -19,7 +19,8 @@
 #   runner baseline identity
 #     -> secrets.sh reads `awscommercialsecret` from Secrets Manager
 #     -> aws sts assume-role into $ASSUME_ROLE_ARN (perkins account)
-#     -> creds written to ~/.aws/credentials so they persist across script lines
+#     -> creds written to ~/.aws/credentials via `aws configure set` so they
+#        persist across script lines (env-var inheritance is unreliable)
 #     -> aws eks update-kubeconfig hits the perkins cluster
 #
 # Variables to set in GitLab:
@@ -52,8 +53,6 @@ stages:
 
 # ----------------------------------------------------------------------
 # matrix: keep in sync with charts/cluster/clusterCharts.yaml
-# GitLab matrix values are static at pipeline-compile time, so the
-# manifest can't be read here. Update both files when charts change.
 # ----------------------------------------------------------------------
 
 .matrix-wave-0: &matrix-wave-0
@@ -70,19 +69,22 @@ stages:
   - { RELEASE: istio-gateway-objects, DIR: istio-gateway-objects, NAMESPACE: istio-system, DEPS: "no"  }
 
 # ----------------------------------------------------------------------
-# shared
+# shared templates (use GitLab `extends:` -- avoid YAML merge keys)
 # ----------------------------------------------------------------------
 
-.common: &common
+.common:
   image: $HELM_IMAGE
 
+.main-only:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
 # Establishes commercial AWS creds via the cross-account assume-role and
-# writes them to ~/.aws/credentials so they persist across script lines.
-# Env-var inheritance from before_script to script is unreliable under some
-# runner executors -- the credentials file is read fresh on each AWS CLI
-# call, which avoids the InvalidClientTokenId failure mode.
+# writes them to ~/.aws/credentials via `aws configure set`. The file is
+# read fresh on each AWS CLI call, so cred persistence does not depend on
+# env-var inheritance between script lines.
 .aws-eks:
-  <<: *common
+  extends: .common
   before_script:
     - echo "=================================================="
     - echo " Target environment : ${ENV:-verify}"
@@ -99,35 +101,23 @@ stages:
         --role-session-name "gitlab-${CI_JOB_ID}" \
         --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
         --output text)
-      AKID=$(echo  "$CREDS" | awk '{print $1}')
-      SKEY=$(echo  "$CREDS" | awk '{print $2}')
-      STOK=$(echo  "$CREDS" | awk '{print $3}')
-      mkdir -p ~/.aws
-      cat > ~/.aws/credentials <<EOF
-      [default]
-      aws_access_key_id=$AKID
-      aws_secret_access_key=$SKEY
-      aws_session_token=$STOK
-      EOF
-      cat > ~/.aws/config <<EOF
-      [default]
-      region=$AWS_REGION
-      EOF
+      AKID=$(echo "$CREDS" | awk '{print $1}')
+      SKEY=$(echo "$CREDS" | awk '{print $2}')
+      STOK=$(echo "$CREDS" | awk '{print $3}')
       unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_DEFAULT_REGION
+      aws configure set aws_access_key_id     "$AKID"
+      aws configure set aws_secret_access_key "$SKEY"
+      aws configure set aws_session_token     "$STOK"
+      aws configure set region                "$AWS_REGION"
     - aws sts get-caller-identity
     - aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
 
-.main-only:
-  rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-
 # ----------------------------------------------------------------------
 # validate: helm template + "rendered something" guard, both envs, MR + main
-# (no cluster access needed; runs without assume-role)
 # ----------------------------------------------------------------------
 
 .template:
-  <<: *common
+  extends: .common
   stage: validate
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -160,8 +150,6 @@ template:wave-3: { extends: .template, parallel: { matrix: *matrix-wave-3 } }
 
 # ----------------------------------------------------------------------
 # verify: standalone "is the auth chain healthy + can we see the cluster"
-# Click any time on a main pipeline. Read-only. No helm, no mutations.
-# needs: [] + allow_failure: true means it neither gates nor blocks anything.
 # ----------------------------------------------------------------------
 
 .verify:
@@ -238,13 +226,11 @@ verify:prod:
 
 # ----------------------------------------------------------------------
 # dev: approve -> (dry-run -> apply) x wave 0..3
-# approve:dev uses needs: [] so it does not wait on the verify stage.
 # ----------------------------------------------------------------------
 
 approve:dev:
-  <<: *common
+  extends: [.common, .main-only]
   stage: approve-dev
-  extends: .main-only
   environment: dev
   when: manual
   allow_failure: false
@@ -320,9 +306,8 @@ deploy:dev:wave-3:
 # ----------------------------------------------------------------------
 
 approve:prod:
-  <<: *common
+  extends: [.common, .main-only]
   stage: approve-prod
-  extends: .main-only
   environment: prod
   when: manual
   allow_failure: false
