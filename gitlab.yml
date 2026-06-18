@@ -2,33 +2,41 @@
 #
 # Cluster chart CI for perkins-deploy-helm-charts.
 #
-# What runs when:
+# Pipelines:
 #   merge_request_event -> validate every chart (helm template + workload guard)
-#   push to main        -> validate + a "deploy" DAG, gated per-env by manual
-#                          approval. Per wave: dry-run -> apply, chained so
-#                          wave N+1's dry-run sees wave N's installed state.
+#   push to main        -> validate + a "deploy" DAG + standalone verify buttons
 #
-# Auth model (matches the dd-operator pipeline pattern):
-#   Runner has baseline AWS creds (project-level CI vars). before_script
-#   calls `aws sts assume-role` to swap into NGDCGitLabTerraformAdminRole in
-#   the target account, then `aws eks update-kubeconfig`.
+# Deploy DAG (each step `when: manual` where noted):
+#   approve:dev (manual) -> (dry-run -> apply) x wave 0..3
+#                        -> approve:prod (manual) -> (dry-run -> apply) x wave 0..3
+#
+# Standalone:
+#   verify:dev / verify:prod  -- click any time on a main pipeline. Runs the
+#   full auth chain + read-only kubectl/AWS checks. Does not gate or trigger
+#   the deploy chain. allow_failure: true so it never blocks.
+#
+# Auth chain (single-partition, cross-account in commercial AWS):
+#   runner baseline identity
+#     -> secrets.sh reads `awscommercialsecret` from Secrets Manager
+#     -> aws sts assume-role into $ASSUME_ROLE_ARN (perkins account)
+#     -> creds written to ~/.aws/credentials so they persist across script lines
+#     -> aws eks update-kubeconfig hits the perkins cluster
 #
 # Variables to set in GitLab:
 #
-# Project-level (protected + masked, baseline creds for the assume-role call):
-#   AWS_ACCESS_KEY_ID
-#   AWS_SECRET_ACCESS_KEY
+# Project-level:
+#   HTTPS_PROXY      http://10.111.225.254:8080
+#   NO_PROXY         ngdc-gitlab-nonprod.fsa.mrd
 #
-# Per-environment, scoped to `dev` and `prod` (Settings -> CI/CD -> Variables):
-#   AWS_ACCOUNT_ID     <perkins dev account>   |   <perkins prod account>
-#   AWS_REGION         us-east-1               |   us-east-1
-#   EKS_CLUSTER_NAME   gorals-dev-primary-ekscluster | gorals-prod-primary-ekscluster
+# Per-environment (Settings -> CI/CD -> Variables, env-scoped, protected):
+#   ASSUME_ROLE_ARN   arn:aws:iam::199570264848:role/<role>   |   arn:aws:iam::<prod-acct>:role/<role>
+#   EKS_CLUSTER_NAME  gcralsp-development-primary-ekscluster  |   gcralsp-production-primary-ekscluster
+#   AWS_REGION        us-east-1                               |   us-east-1
 #
 # Prereqs not managed here:
 #   - cert-manager + metrics-server: EKS add-ons via perkins-infra
 #   - Datadog secret `datadog/datadog`: out-of-band before first install
-#   - NGDCGitLabTerraformAdminRole must exist in both perkins accounts and
-#     trust the baseline AWS_ACCESS_KEY_ID principal for sts:AssumeRole.
+#   - secrets.sh in repo root: fetches deployer IAM user creds from Secrets Manager
 
 variables:
   HELM_IMAGE: alpine/k8s:1.30.4
@@ -36,6 +44,7 @@ variables:
 
 stages:
   - validate
+  - verify
   - approve-dev
   - deploy-dev
   - approve-prod
@@ -65,28 +74,48 @@ stages:
 # ----------------------------------------------------------------------
 
 .common: &common
-  tags:
-    - EKS_RUNNER_GITLAB
   image: $HELM_IMAGE
 
+# Establishes commercial AWS creds via the cross-account assume-role and
+# writes them to ~/.aws/credentials so they persist across script lines.
+# Env-var inheritance from before_script to script is unreliable under some
+# runner executors -- the credentials file is read fresh on each AWS CLI
+# call, which avoids the InvalidClientTokenId failure mode.
 .aws-eks:
   <<: *common
   before_script:
-    - export CLUSTER_NAME="$EKS_CLUSTER_NAME"
-    - export AWS_ACCOUNT="$AWS_ACCOUNT_ID"
-
-    # assume the admin role exactly once
+    - echo "=================================================="
+    - echo " Target environment : ${ENV:-verify}"
+    - echo " Configured region  : ${AWS_REGION}"
+    - echo " Configured cluster : ${EKS_CLUSTER_NAME}"
+    - echo " Assume-role ARN    : ${ASSUME_ROLE_ARN}"
+    - echo "=================================================="
     - |
-      read AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<< \
-        $(aws sts assume-role \
-            --role-arn arn:aws:iam::${AWS_ACCOUNT}:role/NGDCGitLabTerraformAdminRole \
-            --role-session-name gitlab-ci-${CI_JOB_ID} \
-            --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
-            --output text)
-    - export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-
+      set -e
+      source ./secrets.sh
+      CREDS=$(aws sts assume-role \
+        --region "$AWS_REGION" \
+        --role-arn "$ASSUME_ROLE_ARN" \
+        --role-session-name "gitlab-${CI_JOB_ID}" \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)
+      AKID=$(echo  "$CREDS" | awk '{print $1}')
+      SKEY=$(echo  "$CREDS" | awk '{print $2}')
+      STOK=$(echo  "$CREDS" | awk '{print $3}')
+      mkdir -p ~/.aws
+      cat > ~/.aws/credentials <<EOF
+      [default]
+      aws_access_key_id=$AKID
+      aws_secret_access_key=$SKEY
+      aws_session_token=$STOK
+      EOF
+      cat > ~/.aws/config <<EOF
+      [default]
+      region=$AWS_REGION
+      EOF
+      unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_DEFAULT_REGION
     - aws sts get-caller-identity
-    - aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+    - aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
 
 .main-only:
   rules:
@@ -130,6 +159,53 @@ template:wave-2: { extends: .template, parallel: { matrix: *matrix-wave-2 } }
 template:wave-3: { extends: .template, parallel: { matrix: *matrix-wave-3 } }
 
 # ----------------------------------------------------------------------
+# verify: standalone "is the auth chain healthy + can we see the cluster"
+# Click any time on a main pipeline. Read-only. No helm, no mutations.
+# needs: [] + allow_failure: true means it neither gates nor blocks anything.
+# ----------------------------------------------------------------------
+
+.verify:
+  extends: .aws-eks
+  stage: verify
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  when: manual
+  allow_failure: true
+  needs: []
+  script:
+    - |
+      echo "=================================================="
+      echo " Target environment : ${ENV}"
+      echo " Configured region  : ${AWS_REGION}"
+      echo " Configured cluster : ${EKS_CLUSTER_NAME}"
+      echo " Assume-role ARN    : ${ASSUME_ROLE_ARN}"
+      echo "=================================================="
+    - echo "== Who am I (effective identity after assume-role) =="
+    - aws sts get-caller-identity --region "$AWS_REGION"
+    - echo "== Where am I running (region / availability zone) =="
+    - echo "AWS_REGION=${AWS_REGION:-unset} AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-unset}"
+    - echo "== Does the target EKS cluster exist / what is its state =="
+    - aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION" --query 'cluster.{name:name,status:status,version:version,endpoint:endpoint}'
+    - echo "== Kube context that would be used =="
+    - kubectl config current-context
+    - kubectl cluster-info
+    - echo "== Can I reach the API / what nodes exist =="
+    - kubectl get nodes -o wide
+    - echo "== Existing namespaces =="
+    - kubectl get namespaces
+    - echo "Verification complete. No changes were made to the cluster."
+
+verify:dev:
+  extends: .verify
+  environment: dev
+  variables: { ENV: dev }
+
+verify:prod:
+  extends: .verify
+  environment: prod
+  variables: { ENV: prod }
+
+# ----------------------------------------------------------------------
 # deploy primitives: dry-run + apply
 # ----------------------------------------------------------------------
 
@@ -162,6 +238,7 @@ template:wave-3: { extends: .template, parallel: { matrix: *matrix-wave-3 } }
 
 # ----------------------------------------------------------------------
 # dev: approve -> (dry-run -> apply) x wave 0..3
+# approve:dev uses needs: [] so it does not wait on the verify stage.
 # ----------------------------------------------------------------------
 
 approve:dev:
@@ -171,6 +248,7 @@ approve:dev:
   environment: dev
   when: manual
   allow_failure: false
+  needs: []
   script: ['echo "dev deploy approved"']
 
 dry-run:dev:wave-0:
