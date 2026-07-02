@@ -1,0 +1,209 @@
+
+
+apiVersion: datadoghq.com/v2alpha1
+kind: DatadogAgent
+metadata:
+  name: datadog
+  namespace: datadog
+spec:
+
+  # =====================================================================
+  # 1. GLOBAL
+  # =====================================================================
+  global:
+    clusterName: "gcralsp-development-primary-ekscluster"
+    site: "datadoghq.com"           # commercial (not ddog-gov.com)
+    # registry: "<perkins ECR mirror>"   # [1] enable if pulling from mirror
+    credentials:
+      apiSecret:
+        secretName: "datadog-secret"
+        keyName: "api-key"
+    # Allocore's chart uses a custom secret backend script. If preserving:
+    secretBackend:
+      command: "/readsecret_multiple_providers.sh"
+    tags:
+      - "env:dev"
+      - "team:perkins-platform"     # [4] adjust to your team tag
+      - "compliance:pii"
+      - "owner:<owner-email>"       # [4]
+
+  # =====================================================================
+  # 2. OVERRIDES
+  # =====================================================================
+  override:
+
+    # -------------------------------------------------------------------
+    # 2a. Node agent (DaemonSet on every node)
+    # -------------------------------------------------------------------
+    nodeAgent:
+      image:
+        name: "datadog/agent"
+        tag: "7.77.1"               # matches Allocore's pinned version
+      # Scheduling — Karpenter usage-based taints (from Allocore)
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: usage
+                    operator: In
+                    values: [workloads, system, startup]
+      tolerations:
+        - { key: usage, operator: Equal, value: workloads, effect: NoSchedule }
+        - { key: usage, operator: Equal, value: system,    effect: NoSchedule }
+        - { key: usage, operator: Equal, value: startup,   effect: NoSchedule }
+
+      containers:
+        agent:
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+
+        # APM trace-agent — noise filters from Allocore
+        trace-agent:
+          env:
+            - name: DD_APM_IGNORE_RESOURCES
+              value: "GET .*health_check.*,GET .*healthcheck.*,django_redis.cache.*,POST .*telemetry.*,GET 404,GET ^/"
+            - name: DD_APM_FILTER_TAGS_REGEX_REJECT
+              value: 'http.useragent:kube-probe/\d+\.\d+ http.useragent:ELB-HealthChecker.* http.url:.*session-time-left.*'
+
+      env:
+        # -- Cloud / metadata --
+        - name: DD_EC2_PREFER_IMDSV2
+          value: "true"
+        - name: DD_CLOUD_PROVIDER_METADATA
+          value: "aws"
+
+        # -- Tags (env & compliance) --
+        - name: DD_TAGS
+          value: "team:perkins-platform,compliance:pii"
+
+        # -- Karpenter node labels as tags (from Allocore) --
+        - name: DD_KUBERNETES_NODE_LABELS_AS_TAGS
+          value: '{"provisioner":"provisioner","karpenter.sh/capacity-type":"capacity-type","karpenter.k8s.aws/instance-family":"instance-family","karpenter.k8s.aws/instance-size":"instance-size","node.kubernetes.io/instance-type":"instance-type","usage":"nodegroup"}'
+
+        # -- Wide-open label/annotation tagging (from Allocore) --
+        - name: DD_KUBERNETES_POD_LABELS_AS_TAGS
+          value: '{"*":"%%label%%"}'
+        - name: DD_KUBERNETES_POD_ANNOTATIONS_AS_TAGS
+          value: '{"*":"%%annotation%%"}'
+        - name: DD_KUBERNETES_NAMESPACE_LABELS_AS_TAGS
+          value: '{"*":"%%label%%"}'
+
+        # -- Container / log exclusions (from Allocore) --
+        - name: DD_CONTAINER_EXCLUDE
+          value: "image:gcr.io/datadoghq/agent image:gcr.io/datadoghq/cluster-agent image:amazon/aws-for-fluent-bit image:docker.io/splunk/fluentd-hec"
+        - name: DD_CONTAINER_EXCLUDE_LOGS
+          value: "kube_namespace:default kube_namespace:kube-system kube_namespace:kube-node-lease kube_namespace:kube-public name:liveness-probe name:fluent-bit"
+
+        # -- Log processing rules (PII redaction) --
+        # [3] Replace this placeholder with Allocore's exact JSON from
+        # charts/cluster/datadog-agent/values.yaml (DD_LOGS_CONFIG_PROCESSING_RULES).
+        # Preserving structure below for reference; do NOT ship without verifying
+        # regex against the source (FSA compliance is non-negotiable).
+        - name: DD_LOGS_CONFIG_PROCESSING_RULES
+          value: >-
+            [
+              {"type":"mask_sequences","name":"social_security_number","replace_placeholder":"[SSN REDACTED]","pattern":"\\b(?:\\d{3}-?\\d{2}-?\\d{4})\\b"},
+              {"type":"mask_sequences","name":"ein_number","replace_placeholder":"[EIN REDACTED]","pattern":"REPLACE_WITH_ALLOCORE_EIN_REGEX"},
+              {"type":"mask_sequences","name":"9_or_10_digit_numbers","replace_placeholder":"[9/10 NUMBERS REDACTED]","pattern":"\\b[0-9]{9,10}\\b"},
+              {"type":"exclude_at_match","name":"debug_logs","pattern":"(DEBUG)"},
+              {"type":"exclude_at_match","name":"cls_password","pattern":"(CLSPassword)"}
+            ]
+
+        # -- Proxy (from Chris's reference) --
+        - name: HTTPS_PROXY
+          value: "http://10.111.225.254:8080"
+        - name: HTTP_PROXY
+          value: "http://10.111.225.254:8080"
+        - name: NO_PROXY
+          value: "localhost,127.0.0.1,::1,169.254.169.254,kubernetes.default.svc,kubernetes.default,.svc,.cluster.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.datadog-cluster-agent,.datadoghq.com,.gr7.us-east-1.eks.amazonaws.com"
+        - name: no_proxy
+          value: "localhost,127.0.0.1,::1,169.254.169.254,kubernetes.default.svc,kubernetes.default,.svc,.cluster.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.datadog-cluster-agent,.datadoghq.com,.gr7.us-east-1.eks.amazonaws.com"
+
+    # -------------------------------------------------------------------
+    # 2b. Cluster agent (Allocore: 3 replicas + PDB + admission controller)
+    # -------------------------------------------------------------------
+    clusterAgent:
+      replicas: 3
+      createPodDisruptionBudget: true
+      image:
+        name: "datadog/cluster-agent"
+        tag: "7.77.1"
+      nodeSelector:
+        usage: system
+      tolerations:
+        - { key: usage, operator: Equal, value: system, effect: NoSchedule }
+      env:
+        - name: DD_EC2_PREFER_IMDSV2
+          value: "true"
+        - name: HTTPS_PROXY
+          value: "http://10.111.225.254:8080"
+        - name: HTTP_PROXY
+          value: "http://10.111.225.254:8080"
+        - name: NO_PROXY
+          value: "localhost,127.0.0.1,::1,169.254.169.254,kubernetes.default.svc,kubernetes.default,.svc,.cluster.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.datadog-cluster-agent,.datadoghq.com,.gr7.us-east-1.eks.amazonaws.com"
+        - name: no_proxy
+          value: "localhost,127.0.0.1,::1,169.254.169.254,kubernetes.default.svc,kubernetes.default,.svc,.cluster.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.datadog-cluster-agent,.datadoghq.com,.gr7.us-east-1.eks.amazonaws.com"
+
+    # -------------------------------------------------------------------
+    # 2c. Cluster-checks runner
+    # -------------------------------------------------------------------
+    clusterChecksRunner:
+      image:
+        name: "datadog/agent"
+        tag: "7.77.1"
+      env:
+        - name: DD_EC2_PREFER_IMDSV2
+          value: "true"
+        - name: HTTPS_PROXY
+          value: "http://10.111.225.254:8080"
+        - name: HTTP_PROXY
+          value: "http://10.111.225.254:8080"
+        - name: NO_PROXY
+          value: "localhost,127.0.0.1,::1,169.254.169.254,kubernetes.default.svc,kubernetes.default,.svc,.cluster.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.datadog-cluster-agent,.datadoghq.com,.gr7.us-east-1.eks.amazonaws.com"
+        - name: no_proxy
+          value: "localhost,127.0.0.1,::1,169.254.169.254,kubernetes.default.svc,kubernetes.default,.svc,.cluster.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.datadog-cluster-agent,.datadoghq.com,.gr7.us-east-1.eks.amazonaws.com"
+
+  # =====================================================================
+  # 3. FEATURES
+  # =====================================================================
+  features:
+    admissionController:
+      enabled: true                 # Allocore has this on
+    clusterChecks:
+      enabled: true
+    orchestratorExplorer:
+      enabled: true
+    logCollection:
+      enabled: true                 # Allocore has logs on
+      containerCollectAll: true
+    liveProcessCollection:
+      enabled: true                 # Allocore: processAgent.processCollection: true
+    kubeStateMetricsCore:
+      enabled: true                 # Allocore: kubeStateMetricsCore.enabled: true
+    dogstatsd:
+      hostPortConfig:
+        enabled: true               # Allocore: useHostPort: true
+        port: 8125
+      nonLocalTraffic: true
+
+    # APM — Allocore has this OFF in Development.
+    # For prod, enable per the deltas at the bottom of this file.
+    apm:
+      instrumentation:
+        enabled: false
+
+    # NPM — off in dev (Allocore's networkMonitoring: enabled: false).
+    npm:
+      enabled: false
+
+    # OTLP receiver — off in dev unless explicitly needed.
+    # otlp:
+    #   receiver:
+    #     protocols:
+    #       grpc: { enabled: true }
+    #       http: { enabled: true }
+
+    # SBOM / CSM — Allocore has sbom.enabled: false, securityAgent.enabled: false.
+    # Leave off in dev.
