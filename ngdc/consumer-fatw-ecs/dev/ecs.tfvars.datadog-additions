@@ -1,0 +1,133 @@
+###############################################################################
+# dev/ecs.tfvars  --  ADDITIONS ONLY
+#
+# Shows exactly what to add to your existing ecs_service map. Everything not
+# shown stays as it is.
+###############################################################################
+
+ecs_service = {
+
+  # ---------------------------------------------------------------------------
+  # frontend_service -- NO Datadog. Left completely untouched.
+  # ---------------------------------------------------------------------------
+  frontend_service = {
+    service_name    = "frontend-service"
+    task_definition = "FATW-Dev-Frontend-TD"
+    desired_count   = 1
+
+    subnets = [
+      "subnet-006a34b1ad999f94a",
+      "subnet-0224b8225a9a90a3e",
+    ]
+    security_groups = ["sg-0cb94c37f68a5ae9d"]
+
+    load_balancer = {
+      target_group_arn = "arn:aws-us-gov:elasticloadbalancing:us-gov-west-1:..."
+      container_name   = "frontend"
+      container_port   = 3000
+    }
+
+    autoscaling = {
+      enabled = true
+
+      # >>> BUG IN YOUR CURRENT FILE <<<
+      # Lines 279-280 both say `min_capacity`. The second is almost certainly
+      # meant to be max_capacity. As written, HCL takes the last value, so
+      # min_capacity = 2 and there is NO max -- the module either falls back to
+      # a default max or fails. Worth fixing in the same MR.
+      min_capacity = 1
+      max_capacity = 2
+
+      cpu_target        = 65
+      alb_request_target = 1000
+      resource_label    = "app/DEV-FATW-ED-GOV-alb/847a64f6418f5cf3/target..."
+    }
+
+    # No datadog_enabled key -> try() returns false -> no sidecars, no diff.
+  }
+
+  # ---------------------------------------------------------------------------
+  # backend_service -- Datadog ON.
+  # ---------------------------------------------------------------------------
+  backend_service = {
+    service_name    = "backend-service"
+    task_definition = "FATW-Dev-Backend-TD"
+    desired_count   = 1
+
+    subnets = [
+      "subnet-006a34b1ad999f94a",
+      "subnet-0224b8225a9a90a3e",
+    ]
+    security_groups = ["sg-0cb94c37f68a5ae9d"]
+
+    load_balancer = {
+      target_group_arn = "arn:aws-us-gov:elasticloadbalancing:us-gov-west-1:..."
+      container_name   = "backend"
+      container_port   = 8080
+    }
+
+    autoscaling = {
+      enabled            = true
+      min_capacity       = 1
+      max_capacity       = 4
+      cpu_target         = 65
+      alb_request_target = 1000
+      resource_label     = "app/DEV-FATW-ED-GOV-alb/..."
+    }
+
+    # ===== THE OPT-IN =====
+    datadog_enabled = true
+
+    # Drives Datadog's log parsing pipeline. Set to your actual runtime.
+    dd_log_source = "java"
+
+    # Per-service overrides, all optional:
+    # dd_enable_apm       = true
+    # dd_enable_logs      = true
+    # dd_enable_dogstatsd = true
+    # dd_enable_profiling = false
+
+    # ===== SIZING =====
+    # Sidecars add 192 cpu / 640 MiB. Pick app cpu/memory so the SUM is a
+    # legal Fargate pair, then confirm with:
+    #   terraform output datadog_task_sizing
+    #
+    #   832  + 192 = 1024   OK
+    #   1408 + 640 = 2048   OK
+    cpu    = 832
+    memory = 1408
+  }
+}
+
+###############################################################################
+# Datadog globals
+###############################################################################
+
+# GOVCLOUD. Not datadoghq.com. This is a separate Datadog instance with its
+# own org and its own API keys.
+dd_site = "ddog-gov.com"
+
+# If your EKS clusters report to the COMMERCIAL site, this cannot be the same
+# secret -- a commercial key authenticates against nothing on ddog-gov.com.
+# Create a GovCloud-specific secret and point here.
+dd_api_key_secret_name = "platform/datadog/gov-api-key"
+
+dd_tags = {
+  team        = "fatw"
+  cost_center = "cc-4471"
+  partition   = "govcloud"
+}
+
+# Set if the Fargate subnets egress via the corporate proxy. Leave null if
+# they have NAT or VPC endpoints. Wrong value = silent no-data.
+dd_proxy_https = null
+# dd_proxy_https = "http://10.111.225.254:8080"
+
+# GOVCLOUD: public.ecr.aws is NOT reachable. These MUST be private ECR repos
+# in the GovCloud account or the task will fail to pull.
+dd_agent_image     = "<acct>.dkr.ecr.us-gov-west-1.amazonaws.com/datadog/agent@sha256:REPLACE"
+dd_fluentbit_image = "<acct>.dkr.ecr.us-gov-west-1.amazonaws.com/datadog/aws-for-fluent-bit@sha256:REPLACE"
+
+# Module registry + pinned version.
+module_registry        = "gitlab.example.com"
+datadog_module_version = "1.0.0"
