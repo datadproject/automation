@@ -1,0 +1,65 @@
+###############################################################################
+# dev/ecs.tfvars  --  DATADOG ADDITIONS
+###############################################################################
+
+# --- In your existing ecs_service map -----------------------------------
+#
+# frontend_service: add NOTHING. No datadog_enabled key -> excluded.
+#
+# backend_service: add these, plus image_repo if not already present.
+#
+#   datadog_enabled = true
+#   dd_log_source   = "java"
+#   image_repo      = "<acct>.dkr.ecr.us-gov-west-1.amazonaws.com/fatw-backend"
+#
+#   # NOTE: with the official module, cpu/memory are TASK TOTALS, not
+#   # app-only -- the module sizes the agent inside them.
+#   cpu    = 1024
+#   memory = 2048
+
+###############################################################################
+# Datadog
+###############################################################################
+
+datadog_module_version = "1.1.0"
+
+# GOVCLOUD. Separate Datadog org from datadoghq.com, with its own API keys.
+dd_site = "ddog-gov.com"
+
+# If your EKS clusters report to the commercial site, this CANNOT be the same
+# secret. Confirm which org this ECS estate belongs to first.
+dd_api_key_secret_name = "platform/datadog/gov-api-key"
+
+dd_tags = {
+  team        = "fatw"
+  cost_center = "cc-4471"
+  partition   = "govcloud"
+}
+
+dd_log_source = "java"
+
+# --- Images -------------------------------------------------------------
+# Your existing private mirror. Registry is the repo path WITHOUT tag; the
+# module appends the version. Tag-based, not digest -- the module has no
+# digest input.
+dd_agent_registry = "<acct>.dkr.ecr.us-gov-west-1.amazonaws.com/datadog/agent"
+dd_agent_version  = "7.66.1"
+
+dd_fluentbit_registry = "<acct>.dkr.ecr.us-gov-west-1.amazonaws.com/datadog/aws-for-fluent-bit"
+dd_fluentbit_version  = "2.32.5"
+
+# --- Proxy --------------------------------------------------------------
+# Set if the Fargate subnets egress via the corporate proxy; null if they
+# have NAT or VPC endpoints. Wrong value = healthy tasks, zero telemetry.
+dd_proxy_https = null
+# dd_proxy_https = "http://10.111.225.254:8080"
+
+# --- Misc ---------------------------------------------------------------
+# "task" enables process monitoring but limits `ecs execute-command` to one
+# container per task (AWS bug). Set null if your teams exec into containers.
+dd_pid_mode = "task"
+
+common_tags = {
+  ManagedBy = "terraform"
+  Repo      = "fatw-ecs"
+}

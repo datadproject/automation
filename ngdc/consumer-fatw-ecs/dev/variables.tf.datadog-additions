@@ -1,0 +1,132 @@
+###############################################################################
+# variables.tf  --  DATADOG ADDITIONS
+###############################################################################
+
+variable "datadog_module_version" {
+  description = "Pinned version of DataDog/ecs-datadog/aws. Never a branch."
+  type        = string
+  default     = "1.1.0"
+}
+
+variable "image_tag" {
+  description = "App image tag from CI. Also becomes DD_VERSION."
+  type        = string
+}
+
+###############################################################################
+# Datadog
+###############################################################################
+
+variable "dd_api_key_secret_name" {
+  description = "Secrets Manager secret name. GovCloud needs a ddog-gov.com key."
+  type        = string
+}
+
+variable "dd_site" {
+  description = "GovCloud: ddog-gov.com"
+  type        = string
+  default     = "ddog-gov.com"
+
+  validation {
+    condition     = !(can(regex("us-gov", var.aws_region)) && var.dd_site != "ddog-gov.com")
+    error_message = "GovCloud regions must use dd_site = \"ddog-gov.com\". A commercial-site key authenticates against nothing."
+  }
+}
+
+variable "dd_tags" {
+  description = "Converted to the module's comma-separated string form in locals.tf."
+  type        = map(string)
+  default     = {}
+}
+
+variable "dd_log_source" {
+  description = "Default dd_source. Per-service override via dd_log_source."
+  type        = string
+  default     = "ecs"
+}
+
+# --- Images -------------------------------------------------------------
+# The official module composes registry + version into a tag reference. It
+# does NOT accept a digest, so these are tag-pinned. See README.
+
+variable "dd_agent_registry" {
+  description = "Agent image repo WITHOUT tag. GovCloud: private ECR."
+  type        = string
+
+  validation {
+    condition     = !can(regex("^public\\.ecr\\.aws|^gcr\\.io", var.dd_agent_registry))
+    error_message = "public.ecr.aws and gcr.io are unreachable from GovCloud. Use the private ECR mirror."
+  }
+}
+
+variable "dd_agent_version" {
+  description = "Agent image tag. Module default is 'latest' -- never use that."
+  type        = string
+
+  validation {
+    condition     = var.dd_agent_version != "latest"
+    error_message = "Pin an explicit agent version. 'latest' makes deploys non-reproducible."
+  }
+}
+
+variable "dd_fluentbit_registry" {
+  description = "aws-for-fluent-bit repo WITHOUT tag. GovCloud: private ECR."
+  type        = string
+
+  validation {
+    condition     = !can(regex("^public\\.ecr\\.aws|^gcr\\.io", var.dd_fluentbit_registry))
+    error_message = "public.ecr.aws and gcr.io are unreachable from GovCloud. Use the private ECR mirror."
+  }
+}
+
+variable "dd_fluentbit_version" {
+  description = "fluent-bit image tag. Module default is 'stable' -- a floating tag."
+  type        = string
+
+  validation {
+    condition     = !contains(["stable", "latest"], var.dd_fluentbit_version)
+    error_message = "Pin an explicit fluent-bit version. 'stable' and 'latest' float."
+  }
+}
+
+# --- Proxy --------------------------------------------------------------
+
+variable "dd_proxy_https" {
+  description = "e.g. http://10.111.225.254:8080. null when the subnets have NAT."
+  type        = string
+  default     = null
+}
+
+variable "dd_proxy_no_proxy" {
+  description = "MUST include 169.254.170.2 (ECS task metadata endpoint)."
+  type        = list(string)
+  default     = ["169.254.169.254", "169.254.170.2"]
+}
+
+# --- Misc ---------------------------------------------------------------
+
+variable "dd_pid_mode" {
+  description = <<-EOT
+    "task" enables process monitoring but triggers an AWS bug limiting
+    `ecs execute-command` to one container per task. null disables process
+    monitoring and restores full exec access.
+  EOT
+  type        = string
+  default     = "task"
+}
+
+variable "common_tags" {
+  type    = map(string)
+  default = {}
+}
+
+###############################################################################
+# ecs_service map -- two new OPTIONAL attributes
+#
+# If your existing type is `type = any`, nothing to change. Otherwise add:
+#
+#   datadog_enabled = optional(bool, false)
+#   dd_log_source   = optional(string)
+#
+# frontend_service sets neither, so it is excluded.
+###############################################################################

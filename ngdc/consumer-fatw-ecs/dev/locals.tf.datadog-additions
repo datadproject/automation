@@ -1,0 +1,57 @@
+###############################################################################
+# locals.tf  --  DATADOG ADDITIONS
+#
+# Merge into your existing locals.tf. Identical across dev/test/stage/prod.
+###############################################################################
+
+locals {
+  # The opt-in filter. frontend_service has no datadog_enabled key, so try()
+  # returns false and it never reaches the Datadog module.
+  dd_services = {
+    for name, svc in var.ecs_service : name => svc
+    if try(svc.datadog_enabled, false)
+  }
+
+  # Services whose task definitions are still built by YOUR existing
+  # aws_ecs_task_definition resource. See task-definitions-PATCH.md.
+  non_dd_services = {
+    for name, svc in var.ecs_service : name => svc
+    if !try(svc.datadog_enabled, false)
+  }
+
+  # dd_tags is a STRING in the official module, not a map.
+  dd_tags_string = join(", ", [for k, v in var.dd_tags : "${k}:${v}"])
+
+  # ---------------------------------------------------------------------------
+  # App container for Datadog-enabled services.
+  #
+  # Deliberately plain: NO Datadog env vars, NO log driver, NO dependsOn, NO
+  # volume mounts. The official module injects all of that. Adding them here
+  # would duplicate or fight with what the module sets.
+  # ---------------------------------------------------------------------------
+  dd_app_container = {
+    for name, svc in local.dd_services : name => {
+      name      = svc.load_balancer.container_name
+      image     = "${svc.image_repo}:${var.image_tag}"
+      essential = true
+
+      portMappings = [{
+        containerPort = svc.load_balancer.container_port
+        protocol      = "tcp"
+      }]
+
+      environment = [
+        for k, v in try(svc.environment, {}) : { name = k, value = v }
+      ]
+    }
+  }
+
+  # ---------------------------------------------------------------------------
+  # Task definition ARNs, whichever resource produced them. The ECS service
+  # resource reads from this so it does not care which path a service took.
+  # ---------------------------------------------------------------------------
+  task_definition_arns = merge(
+    { for name, m in module.datadog_task : name => m.arn },
+    { for name, td in aws_ecs_task_definition.this : name => td.arn },
+  )
+}
