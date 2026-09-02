@@ -1,0 +1,44 @@
+###############################################################################
+# test/ecs.tfvars  --  DATADOG ADDITIONS ONLY
+#
+# datadog.tf is byte-identical across dev/test/stage/prod. Everything that
+# differs between environments lives here.
+###############################################################################
+
+# --- In your existing ecs_service map -----------------------------------
+#
+# frontend_service: add NOTHING. No datadog_enabled key -> excluded.
+#
+# backend_service: add these four lines.
+#
+#   datadog_enabled = true
+#   dd_log_source   = "java"          # your actual runtime
+#   cpu             = 832             # 832  + 192 = 1024  OK
+#   memory          = 1408            # 1408 + 640 = 2048  OK
+
+###############################################################################
+# Datadog globals
+###############################################################################
+
+dd_site = "ddog-gov.com"
+
+# Same GovCloud Datadog org as the other envs. The env: tag separates them.
+dd_api_key_secret_name = "platform/datadog/gov-api-key"
+
+dd_tags = {
+  team        = "fatw"
+  cost_center = "cc-4471"
+  partition   = "govcloud"
+}
+
+# Confirm per-VPC. Test may differ from dev if it sits in another VPC.
+dd_proxy_https = null
+
+# Private ECR, pinned by digest. Identical across envs -- one mirrored image,
+# promoted unchanged. If test pulls a different digest than dev, you are no
+# longer testing what you will ship.
+dd_agent_image     = "<acct>.dkr.ecr.us-gov-west-1.amazonaws.com/datadog/agent@sha256:REPLACE"
+dd_fluentbit_image = "<acct>.dkr.ecr.us-gov-west-1.amazonaws.com/datadog/aws-for-fluent-bit@sha256:REPLACE"
+
+module_registry        = "gitlab.example.com"
+datadog_module_version = "1.0.0"   # bump only after dev has soaked

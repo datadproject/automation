@@ -1,0 +1,27 @@
+###############################################################################
+# outputs.tf  --  DATADOG ADDITIONS
+#
+# Merge into your existing outputs.tf. These are the pre-apply review gate.
+###############################################################################
+
+output "datadog_enabled_services" {
+  description = "Sanity check. Should list backend_service only."
+  value       = keys(local.dd_services)
+}
+
+output "datadog_task_sizing" {
+  description = "Confirm these land on legal Fargate cpu/memory pairs before apply."
+  value = {
+    for name, svc in local.dd_services : name => {
+      app_cpu     = svc.cpu
+      app_memory  = svc.memory
+      task_cpu    = svc.cpu + local.dd_extra_cpu[name]
+      task_memory = svc.memory + local.dd_extra_memory[name]
+    }
+  }
+}
+
+output "datadog_log_groups" {
+  description = "Module-created sidecar log groups."
+  value       = { for name, m in module.datadog : name => m.log_group_name }
+}

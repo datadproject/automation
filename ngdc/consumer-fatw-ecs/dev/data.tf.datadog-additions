@@ -1,0 +1,14 @@
+###############################################################################
+# data.tf  --  DATADOG ADDITIONS
+#
+# Merge into your existing data.tf. Identical in dev/test/stage/prod.
+###############################################################################
+
+# GovCloud: partition is "aws-us-gov", not "aws". Every hardcoded arn:aws: in
+# this repo is a latent bug. Build ARNs from this instead:
+#
+#   "arn:${data.aws_partition.current.partition}:iam::aws:policy/..."
+#
+# The Datadog module also exposes this as module.datadog[...].partition, so
+# you can drop this block if you would rather source it from there.
+data "aws_partition" "current" {}
