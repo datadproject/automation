@@ -1,0 +1,143 @@
+###############################################################################
+# consumer-fatw-ecs/dev/locals.tf.datadog-additions
+#
+# PASTE INTO dev/locals.tf (create the file if it does not exist).
+#
+# Builds local.ecs_task_definition_effective from var.ecs_task_definition.
+# Task definitions whose service did not opt in pass through UNCHANGED --
+# byte-identical, no plan diff.
+#
+# Nothing here creates a task definition. ngdc-ecs-cluster-module stays the
+# sole owner.
+###############################################################################
+
+locals {
+  #############################################################################
+  # 1. Opt-in filter over ecs_service
+  #
+  # frontend_service has no datadog_enabled key -> try() -> false -> excluded.
+  # Only backend_service opts in.
+  #############################################################################
+  dd_services = {
+    for name, svc in var.ecs_service : name => svc
+    if try(svc.datadog_enabled, false)
+  }
+
+  #############################################################################
+  # 2. Task-definition KEY -> service key
+  #
+  # ecs_service.backend_service.task_definition = "FATW-Dev-Backend-TD", which
+  # is the map key in ecs_task_definition (confirmed by
+  # ngdc-ecs-cluster-module/main.tf:130, which indexes
+  # aws_ecs_task_definition.ecs_task_definition[each.value.task_definition]).
+  #
+  # Task definitions with no service pointing at them -- DB-Import, Scraper,
+  # Importer, Exporter -- are absent from this map and pass through untouched.
+  #############################################################################
+  dd_td_to_service = {
+    for name, svc in local.dd_services : svc.task_definition => name
+  }
+
+  #############################################################################
+  # 3. Which container inside the task definition is the app
+  #
+  # Defaults to the ALB target container name ("backend"). Override per
+  # service with dd_app_container_name if the instrumented container is not
+  # the load-balanced one.
+  #############################################################################
+  dd_app_container_name = {
+    for name, svc in local.dd_services : name => try(
+      svc.dd_app_container_name,
+      svc.load_balancer.container_name,
+    )
+  }
+
+  #############################################################################
+  # 4. The effective task-definition map
+  #
+  # container_definitions is a MAP keyed by CD name (FATW-Dev-Backend-CD), so
+  # adding sidecars is merge(), not concat().
+  #
+  # For the Datadog task definition:
+  #   - task-level cpu / memory / roles / efs_volume / awslogs_* UNCHANGED
+  #   - the app container keeps its image, environment, secrets, mount_points
+  #     and port_mappings; Datadog vars are MERGED into environment
+  #   - datadog-agent and log_router are added as new map entries
+  #############################################################################
+  ecs_task_definition_effective = {
+    for td_key, td in var.ecs_task_definition : td_key => (
+
+      contains(keys(local.dd_td_to_service), td_key)
+
+      ? merge(td, {
+        container_definitions = merge(
+          {
+            for cd_key, cd in td.container_definitions : cd_key => (
+
+              cd.container_name == local.dd_app_container_name[local.dd_td_to_service[td_key]]
+
+              ? merge(
+                cd,
+                {
+                  # Append to the existing map, never replace it. Backend's
+                  # DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_IAM_AUTH all
+                  # survive.
+                  environment = merge(
+                    try(cd.environment, {}),
+                    module.datadog[local.dd_td_to_service[td_key]].app_environment,
+                  )
+                },
+
+                # FireLens replaces the app's log driver ONLY when logs are
+                # enabled. When disabled the module returns null and the
+                # container keeps the module's awslogs config.
+                module.datadog[local.dd_td_to_service[td_key]].app_log_configuration == null
+                ? {}
+                : { log_configuration = module.datadog[local.dd_td_to_service[td_key]].app_log_configuration },
+
+                # Omit the key entirely rather than setting an empty list.
+                length(module.datadog[local.dd_td_to_service[td_key]].app_depends_on) == 0
+                ? {}
+                : { container_depends_on = concat(
+                  try(cd.container_depends_on, []),
+                  module.datadog[local.dd_td_to_service[td_key]].app_depends_on,
+                ) },
+
+                # Empty unless emit_docker_labels = true.
+                length(module.datadog[local.dd_td_to_service[td_key]].app_docker_labels) == 0
+                ? {}
+                : { docker_labels = merge(
+                  try(cd.docker_labels, {}),
+                  module.datadog[local.dd_td_to_service[td_key]].app_docker_labels,
+                ) },
+              )
+
+              # Any other container in the task passes through untouched.
+              : cd
+            )
+          },
+          # New map entries: datadog-agent, and log_router when logs are on.
+          module.datadog[local.dd_td_to_service[td_key]].sidecar_container_definitions,
+        )
+      })
+
+      # Not a Datadog task definition -- returned exactly as supplied.
+      : td
+    )
+  }
+
+  #############################################################################
+  # 5. Execution role NAME, derived from the ARN already in tfvars
+  #
+  # aws_iam_role_policy takes a name, not an ARN. Your tfvars supplies
+  #   arn:aws-us-gov:iam::685777967047:role/NGDC-FATW-ECS-Execution-Role
+  # and the name is always the last "/" segment.
+  #
+  # The role itself is created outside both modules, so there is no
+  # dependency cycle and nothing here takes ownership of it.
+  #############################################################################
+  dd_execution_role_names = {
+    for name, svc in local.dd_services :
+    name => reverse(split("/", var.ecs_task_definition[svc.task_definition].task_execution_role))[0]
+  }
+}

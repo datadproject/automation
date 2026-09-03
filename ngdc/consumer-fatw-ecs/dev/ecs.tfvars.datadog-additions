@@ -1,0 +1,98 @@
+###############################################################################
+# consumer-fatw-ecs/dev/ecs.tfvars.datadog-additions
+#
+# Real values from your dev/ecs.tfvars. Placeholders marked <<<REPLACE>>>.
+###############################################################################
+
+###############################################################################
+# 1. ecs_service -- add FOUR LINES to backend_service (line ~288)
+###############################################################################
+#
+#   backend_service = {
+#     service_name    = "backend-service"
+#     task_definition = "FATW-Dev-Backend-TD"
+#     ...  everything else unchanged ...
+#
+#     # ===== ADD THESE =====
+#     datadog_enabled = true
+#     dd_log_source   = "php"        # Drupal backend
+#
+#     # Start WITHOUT logs so only the Tier A module patch is needed.
+#     # Flip to true once Tier B is merged.
+#     dd_enable_logs  = false
+#   }
+#
+# frontend_service (line 258): add NOTHING.
+# Its absence of datadog_enabled is the opt-out.
+
+###############################################################################
+# 2. ecs_task_definition -- CHANGE NOTHING
+###############################################################################
+#
+# FATW-Dev-Backend-TD stays exactly as it is:
+#
+#   cpu    = 1024        <- unchanged
+#   memory = 2048        <- unchanged
+#
+# The Agent has no container-level reservation (matching every other
+# container in your file, where container_cpu / container_memory are
+# commented out), so it shares the task allocation. Backend currently uses a
+# fraction of 1024/2048; the Agent adds roughly 150-250 MiB.
+#
+# Nothing is added to task-level cpu/memory. Fargate sizes are an allowlist
+# and 1024 + 192 = 1216 is not one of them.
+#
+# The other five task definitions -- Frontend, DB-Import, Scraper, Importer,
+# Exporter -- are untouched: they pass through
+# local.ecs_task_definition_effective byte-identical.
+
+###############################################################################
+# 3. Datadog settings -- APPEND at the end of the file
+#    (after trackingid_tag, line ~323)
+###############################################################################
+
+# GovCloud. Separate Datadog instance from datadoghq.com, with its own org
+# and its own API keys.
+dd_site = "ddog-gov.com"
+
+# <<<REPLACE>>> Create this in Secrets Manager, same account/region as
+# fatw_drupal_hash_salt (685777967047 / us-gov-west-1).
+#
+# If your EKS clusters report to the COMMERCIAL Datadog site, this CANNOT be
+# the same key -- a commercial key authenticates against nothing on
+# ddog-gov.com. Confirm which org this ECS estate belongs to first.
+dd_api_key_secret_name = "fatw_datadog_api_key"
+
+# Uncomment only if the secret is JSON rather than a plain string.
+# dd_api_key_secret_json_key = "api-key"
+
+dd_log_source = "php"
+
+# --- Images: private ECR in GovCloud, pinned ----------------------------
+#
+# <<<REPLACE>>> with your mirrored repo paths and real tags.
+# Same sandbox/financial-aid-toolkit ECR your app images use, or a dedicated
+# repo. public.ecr.aws and gcr.io are unreachable from GovCloud.
+dd_agent_image = "093737011827.dkr.ecr.us-gov-west-1.amazonaws.com/sandbox/financial-aid-toolkit/datadog-agent:7.66.1"
+
+# Only needed when dd_enable_logs = true.
+# dd_fluentbit_image = "093737011827.dkr.ecr.us-gov-west-1.amazonaws.com/sandbox/financial-aid-toolkit/aws-for-fluent-bit:2.32.5"
+
+# --- Proxy ---------------------------------------------------------------
+#
+# Your subnets (subnet-006a34b1ad999f94a, subnet-0224b8225a9a90a3e) already
+# pull images from ECR and reach RDS. Confirm whether they have NAT or egress
+# only via the corporate proxy, because a wrong value here gives healthy
+# tasks and ZERO telemetry with no error anywhere.
+#
+# NAT / VPC endpoints -> leave both null.
+# Proxy-only          -> set BOTH. The module fails the plan if you set the
+#                        Agent one and leave Fluent Bit null.
+dd_agent_proxy_https = null
+dd_fluentbit_proxy   = null
+
+# dd_agent_proxy_https = "http://10.111.225.254:8080"
+# dd_fluentbit_proxy   = "http://10.111.225.254:8080"   # http:// even for TLS
+
+# 169.254.170.2, localhost and 127.0.0.1 are unioned in by the module.
+dd_agent_proxy_no_proxy = ["169.254.169.254"]
