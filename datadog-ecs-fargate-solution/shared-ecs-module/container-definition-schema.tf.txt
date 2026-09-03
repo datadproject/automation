@@ -1,0 +1,43 @@
+# Merge these attributes into the existing container object inside
+# variable "ecs_task_definition". Keep all existing attributes as-is.
+
+secrets = optional(list(object({
+  name      = string
+  valueFrom = string
+})), [])
+
+port_mappings = optional(list(object({
+  containerPort = number
+  hostPort      = number
+  protocol      = string
+})), [])
+
+health_check = optional(object({
+  command     = list(string)
+  interval    = optional(number)
+  timeout     = optional(number)
+  retries     = optional(number)
+  startPeriod = optional(number)
+}))
+
+container_depends_on = optional(list(object({
+  containerName = string
+  condition     = string
+})), [])
+
+firelens_configuration = optional(object({
+  type    = string
+  options = optional(map(string), {})
+}))
+
+log_configuration = optional(object({
+  logdriver = string
+  options   = map(string)
+  secretOptions = optional(list(object({
+    name      = string
+    valueFrom = string
+  })), [])
+}))
+
+docker_labels = optional(map(string), {})
+

@@ -1,0 +1,62 @@
+# Replace only the current jsonencode expression assigned to
+# container_definitions in aws_ecs_task_definition. The surrounding resource,
+# volumes, runtime_platform, tags, and services stay unchanged.
+
+container_definitions = jsonencode([
+  for container_key, cdef in each.value.container_definitions : merge(
+    {
+      name      = cdef.container_name
+      image     = cdef.image
+      essential = cdef.essential
+      environment = [
+        for key, value in try(cdef.environment, {}) : {
+          name  = key
+          value = value
+        }
+      ]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = each.value.awslogs_group
+          "awslogs-region"        = each.value.awslogs_region
+          "awslogs-stream-prefix" = each.value.awslogs_stream_prefix
+        }
+      }
+    },
+    try(cdef.container_cpu, null) == null ? {} : {
+      cpu = cdef.container_cpu
+    },
+    try(cdef.container_memory, null) == null ? {} : {
+      memory = cdef.container_memory
+    },
+    length(try(cdef.secrets, [])) == 0 ? {} : {
+      secrets = cdef.secrets
+    },
+    length(try(cdef.port_mappings, [])) == 0 ? {} : {
+      portMappings = cdef.port_mappings
+    },
+    try(cdef.health_check, null) == null ? {} : {
+      healthCheck = cdef.health_check
+    },
+    length(try(cdef.container_depends_on, [])) == 0 ? {} : {
+      dependsOn = cdef.container_depends_on
+    },
+    try(cdef.firelens_configuration, null) == null ? {} : {
+      firelensConfiguration = cdef.firelens_configuration
+    },
+    try(cdef.log_configuration, null) == null ? {} : {
+      logConfiguration = {
+        logDriver     = cdef.log_configuration.logdriver
+        options       = cdef.log_configuration.options
+        secretOptions = try(cdef.log_configuration.secretOptions, [])
+      }
+    },
+    length(try(cdef.mount_points, [])) == 0 ? {} : {
+      mountPoints = cdef.mount_points
+    },
+    length(try(cdef.docker_labels, {})) == 0 ? {} : {
+      dockerLabels = cdef.docker_labels
+    },
+  )
+])
+

@@ -1,0 +1,23 @@
+dd_task_definition_key      = "FATW-Dev-Backend-TD"
+dd_container_definition_key = "FATW-Dev-Backend-CD"
+
+dd_api_key_secret_name     = "fatw_datadog_api_key"
+dd_site                    = "ddog-gov.com"
+dd_env                     = "dev"
+dd_service                 = "backend-service"
+dd_version                 = "unknown"
+dd_log_source              = "php"
+dd_agent_image             = "<AGENT_IMAGE_URI>"
+
+# First rollout: Agent only. Existing awslogs configuration remains intact.
+dd_enable_logs = false
+
+# Required only for the second rollout when FireLens logs are enabled.
+dd_fluentbit_image = null
+
+# Leave null when the private subnets have direct/NAT egress.
+dd_agent_proxy_https    = null
+dd_agent_proxy_http     = null
+dd_agent_proxy_no_proxy = []
+dd_fluentbit_proxy      = null
+
