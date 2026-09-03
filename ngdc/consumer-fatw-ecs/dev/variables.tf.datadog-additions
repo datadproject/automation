@@ -1,0 +1,144 @@
+###############################################################################
+# consumer-fatw-ecs/dev/variables.tf.datadog-additions
+#
+# PASTE INTO dev/variable.tf  (note: your file is variable.tf, singular).
+###############################################################################
+
+variable "dd_module_source" {
+  description = <<-EOT
+    Source of ngdc-datadog-ecs-sidecar-module.
+
+    Terraform requires module source to be a literal in most cases; a variable
+    works here only because the value is constant per environment. If your
+    Terraform version rejects it, inline the string in datadog.tf instead.
+
+    Move off a branch ref to a TAG before prod -- a push to the branch would
+    change every consumer's next apply.
+  EOT
+  type        = string
+}
+
+variable "image_tag" {
+  description = <<-EOT
+    Becomes DD_VERSION so every trace, log line and metric carries the
+    deployed build. Your images already embed a SHA, e.g.
+      fatoolkit-backend-dev-48415cc1
+    Pass just the SHA (48415cc1) or the whole tag -- it is a label only.
+
+    Wire from CI: export TF_VAR_image_tag="$CI_COMMIT_SHORT_SHA"
+  EOT
+  type        = string
+  default     = "unset"
+}
+
+###############################################################################
+# Datadog
+###############################################################################
+
+variable "dd_site" {
+  description = "GovCloud: ddog-gov.com. Validated against the partition in the module."
+  type        = string
+  default     = "ddog-gov.com"
+}
+
+variable "dd_api_key_secret_name" {
+  description = <<-EOT
+    Secrets Manager secret NAME (not ARN). Terraform reads metadata only.
+    Same account and region as fatw_drupal_hash_salt, which the backend
+    already consumes the same way.
+  EOT
+  type        = string
+}
+
+variable "dd_api_key_secret_json_key" {
+  description = "Key inside a JSON secret. null for a plain-string secret."
+  type        = string
+  default     = null
+}
+
+variable "dd_log_source" {
+  description = "Default dd_source. Backend is Drupal/PHP."
+  type        = string
+  default     = "php"
+}
+
+# --- Images: private ECR in GovCloud, pinned -----------------------------
+
+variable "dd_agent_image" {
+  description = "Fully-qualified pinned Agent image from your GovCloud ECR."
+  type        = string
+}
+
+variable "dd_fluentbit_image" {
+  description = "Fully-qualified pinned aws-for-fluent-bit image. Required only when logs are on."
+  type        = string
+  default     = null
+}
+
+# --- Proxy: Agent and Fluent Bit are SEPARATE ----------------------------
+
+variable "dd_agent_proxy_https" {
+  description = "Agent DD_PROXY_HTTPS. null when the subnets have NAT or VPC endpoints."
+  type        = string
+  default     = null
+}
+
+variable "dd_agent_proxy_http" {
+  description = "Agent DD_PROXY_HTTP. Falls back to dd_agent_proxy_https."
+  type        = string
+  default     = null
+}
+
+variable "dd_agent_proxy_no_proxy" {
+  description = <<-EOT
+    Extra NO_PROXY entries. The module always unions in 169.254.170.2,
+    localhost and 127.0.0.1, so those need not be listed.
+  EOT
+  type        = list(string)
+  default     = ["169.254.169.254"]
+}
+
+variable "dd_fluentbit_proxy" {
+  description = <<-EOT
+    Fluent Bit Datadog-output proxy. MUST be http:// form.
+    Fluent Bit does NOT read DD_PROXY_HTTPS -- separate container, separate
+    setting. Setting the Agent proxy without this fails at plan time.
+  EOT
+  type        = string
+  default     = null
+}
+
+###############################################################################
+# ecs_service -- OPTIONAL attributes added by this change
+#
+# Your ngdc-ecs-cluster-module types ecs_service strictly, so the CONSUMER's
+# own variable must accept these. If dev/variable.tf declares ecs_service as
+# `type = any`, nothing to do. If it mirrors the module's typed object, add:
+#
+#   datadog_enabled       = optional(bool, false)   <- the entire opt-in
+#   dd_log_source         = optional(string)
+#   dd_app_container_name = optional(string)
+#   dd_enable_apm         = optional(bool, true)
+#   dd_enable_logs        = optional(bool, true)
+#   dd_enable_dogstatsd   = optional(bool, true)
+#   dd_enable_profiling   = optional(bool, false)
+#   dd_app_wait_for_agent = optional(bool, false)
+#   dd_agent_cpu          = optional(number)
+#   dd_agent_memory       = optional(number)
+#   dd_fluentbit_cpu      = optional(number)
+#   dd_fluentbit_memory   = optional(number)
+#
+# IMPORTANT: these are consumed by local.dd_services BEFORE the map reaches
+# ngdc-ecs-cluster-module. The generic module never sees them and needs no
+# schema change for ecs_service. If its typed object rejects the extra keys,
+# strip them in the module call:
+#
+#   ecs_service = {
+#     for k, v in var.ecs_service : k => {
+#       for ak, av in v : ak => av
+#       if !startswith(ak, "dd_") && ak != "datadog_enabled"
+#     }
+#   }
+#
+# frontend_service sets none of them and is untouched either way.
+###############################################################################
