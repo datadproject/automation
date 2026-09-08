@@ -767,5 +767,44 @@ merge(
   }
 )
 
+environment = merge(
+  {
+    ECS_FARGATE                     = "true"
+    DD_SITE                         = var.dd_site
+    DD_ENV                          = var.environment_tag
+    DD_SERVICE                      = config.service
+    DD_VERSION                      = config.version
+    DD_APM_ENABLED                  = "true"
+    DD_APM_NON_LOCAL_TRAFFIC        = "true"
+    DD_DOGSTATSD_NON_LOCAL_TRAFFIC  = "true"
+  },
 
+  var.dd_proxy_https != null ? {
+    DD_PROXY_HTTP                  = var.dd_proxy_https
+    DD_PROXY_HTTPS                 = var.dd_proxy_https
+    DD_PROXY_NO_PROXY              = join(" ", var.dd_proxy_no_proxy)
+    DD_NO_PROXY_NONEXACT_MATCH     = "true"
+  } : {}
+)
+
+dd_app_environment = {
+  for td_name, config in local.datadog_enabled_tasks :
+
+  td_name => {
+    DD_ENV                     = var.environment_tag
+    DD_SERVICE                 = config.service
+    DD_VERSION                 = config.version
+    DD_TRACE_ENABLED           = "true"
+    DD_TRACE_AGENT_URL         = "http://127.0.0.1:8126"
+    DD_DOGSTATSD_URL           = "udp://127.0.0.1:8125"
+    DD_LOGS_INJECTION          = "true"
+    DD_RUNTIME_METRICS_ENABLED = "true"
+  }
+}
+
+
+environment = merge(
+  try(container.environment, {}),
+  local.dd_app_environment[td_name]
+)
 
