@@ -651,7 +651,121 @@ locals {
 
 
 
+merge(
+  {
+    # KEEP ALL EXISTING FIELDS HERE
 
+    name      = container.container_name
+    image     = container.image
+    essential = container.essential
+
+    cpu    = try(container.container_cpu, null)
+    memory = try(container.container_memory, null)
+
+    environment = try(container.environment, [])
+
+    portMappings = try(container.port_mappings, [])
+  },
+
+
+  ###########################################################################
+  # Secrets
+  ###########################################################################
+
+  length(try(container.secrets, [])) > 0 ? {
+    secrets = container.secrets
+  } : {},
+
+
+  ###########################################################################
+  # Docker labels
+  ###########################################################################
+
+  length(try(container.docker_labels, {})) > 0 ? {
+    dockerLabels = container.docker_labels
+  } : {},
+
+
+  ###########################################################################
+  # Dependencies
+  ###########################################################################
+
+  length(try(container.depends_on, [])) > 0 ? {
+    dependsOn = container.depends_on
+  } : {},
+
+
+  ###########################################################################
+  # Health check
+  ###########################################################################
+
+  try(container.health_check, null) != null ? {
+    healthCheck = {
+      command = container.health_check.command
+
+      interval = container.health_check.interval
+      timeout  = container.health_check.timeout
+      retries  = container.health_check.retries
+
+      startPeriod = container.health_check.start_period
+    }
+  } : {},
+
+
+  ###########################################################################
+  # FireLens
+  ###########################################################################
+
+  try(container.firelens_configuration, null) != null ? {
+    firelensConfiguration = {
+      type = container.firelens_configuration.type
+
+      options = try(
+        container.firelens_configuration.options,
+        {}
+      )
+    }
+  } : {},
+
+
+  ###########################################################################
+  # Logging
+  #
+  # Explicit config wins.
+  # Otherwise keep current awslogs behavior.
+  ###########################################################################
+
+  try(container.log_configuration, null) != null ? {
+
+    logConfiguration = {
+      logDriver = container.log_configuration.log_driver
+
+      options = try(
+        container.log_configuration.options,
+        {}
+      )
+
+      secretOptions = try(
+        container.log_configuration.secret_options,
+        []
+      )
+    }
+
+  } : {
+
+    logConfiguration = {
+      logDriver = "awslogs"
+
+      options = {
+        "awslogs-group" = container.awslogs_group
+
+        "awslogs-region" = container.awslogs_region
+
+        "awslogs-stream-prefix" = container.awslogs_stream_prefix
+      }
+    }
+  }
+)
 
 
 
