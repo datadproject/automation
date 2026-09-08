@@ -1,74 +1,353 @@
-"FATW-Dev-Backend-TD" = {
-  family                   = "FATW-Dev-Backend-TD"
-  network_mode             = "awsvpc"
-  requires_compatibilities = ["FARGATE"]
+variable "datadog_tasks" {
+  description = "Task definitions that should receive the Datadog bolt-on."
 
-  cpu    = 1024
-  memory = 2048
+  type = map(object({
+    enabled             = optional(bool, true)
+    app_container_key   = string
+    service             = string
+    version             = string
+    log_source          = optional(string, "ecs")
+    execution_role_name = string
+  }))
 
-  datadog = {
-    enabled    = true
+  default = {}
+}
+
+variable "dd_site" {
+  description = "Datadog site."
+  type        = string
+  default     = "ddog-gov.com"
+}
+
+variable "dd_logs_host" {
+  description = "Datadog Logs intake hostname."
+  type        = string
+}
+
+variable "dd_api_key_secret_name" {
+  description = "Secrets Manager secret containing the Datadog API key."
+  type        = string
+}
+
+variable "dd_agent_image" {
+  description = "Private ECR Datadog Agent image."
+  type        = string
+}
+
+variable "dd_fluentbit_image" {
+  description = "Private ECR AWS for Fluent Bit image."
+  type        = string
+}
+
+variable "dd_proxy_https" {
+  description = "Corporate proxy."
+  type        = string
+  default     = null
+}
+
+variable "dd_proxy_no_proxy" {
+  type = list(string)
+
+  default = [
+    "localhost",
+    "127.0.0.1",
+    "169.254.169.254",
+    "169.254.170.2"
+  ]
+}
+
+
+
+
+###############################################################################
+# DATADOG
+###############################################################################
+
+dd_site = "ddog-gov.com"
+
+dd_logs_host = "http-intake.logs.ddog-gov.datadoghq.com"
+
+dd_api_key_secret_name = "fatw_datadog_api_key"
+
+dd_agent_image = "093737011827.dkr.ecr.us-gov-west-1.amazonaws.com/sandbox/financial-aid-toolkit/datadog-agent:7.66.1"
+
+dd_fluentbit_image = "093737011827.dkr.ecr.us-gov-west-1.amazonaws.com/sandbox/financial-aid-toolkit/aws-for-fluent-bit:2.32.5"
+
+dd_proxy_https = "http://10.111.225.254:8080"
+
+dd_proxy_no_proxy = [
+  "localhost",
+  "127.0.0.1",
+  "169.254.169.254",
+  "169.254.170.2"
+]
+
+datadog_tasks = {
+  "FATW-Dev-Backend-TD" = {
+    enabled = true
+
+    # KEY from the existing container_definitions map
+    app_container_key = "FATW-Dev-Backend-CB"
+
     service    = "backend-service"
+    version    = "1.0.0"
     log_source = "php"
 
-    api_key_secret_name = "fatw_datadog_api_key"
-
-    site = "ddog-gov.com"
-
-    agent_image = "YOUR-ECR/datadog-agent:7.66.1"
-
-    fluentbit_image = "YOUR-ECR/aws-for-fluent-bit:2.32.5"
-
-    proxy = "http://10.111.225.254:8080"
-  }
-
-  container_definitions = {
-    "FATW-Dev-Backend-CB" = {
-      # your existing configuration stays here
-    }
+    # EXISTING task EXECUTION role NAME, not ARN.
+    execution_role_name = "REPLACE_WITH_YOUR_EXISTING_EXECUTION_ROLE_NAME"
   }
 }
 
 
+  datadog_tasks = var.datadog_tasks
+
+  dd_site                = var.dd_site
+  dd_logs_host           = var.dd_logs_host
+  dd_api_key_secret_name = var.dd_api_key_secret_name
+
+  dd_agent_image     = var.dd_agent_image
+  dd_fluentbit_image = var.dd_fluentbit_image
+
+  dd_proxy_https  = var.dd_proxy_https
+  dd_proxy_no_proxy = var.dd_proxy_no_proxy
 
 
+###############################################################################
+# OPTIONAL DATADOG BOLT-ON
+###############################################################################
 
+variable "datadog_tasks" {
+  description = "Optional Datadog configuration keyed by ECS task definition."
 
+  type = map(object({
+    enabled             = optional(bool, true)
+    app_container_key   = string
+    service             = string
+    version             = string
+    log_source          = optional(string, "ecs")
+    execution_role_name = string
+  }))
 
-datadog = optional(object({
-  enabled             = optional(bool, false)
-  service             = string
-  log_source          = optional(string, "ecs")
-  api_key_secret_name = string
-  site                = optional(string, "datadoghq.com")
-
-  agent_image     = string
-  fluentbit_image = string
-
-  proxy = optional(string)
-}))
-
-data "aws_secretsmanager_secret" "datadog" {
-  for_each = {
-    for name, td in var.ecs_task_definition :
-    name => td
-    if try(td.datadog.enabled, false)
-  }
-
-  name = each.value.datadog.api_key_secret_name
+  default = {}
 }
+
+variable "dd_site" {
+  type    = string
+  default = "datadoghq.com"
+}
+
+variable "dd_logs_host" {
+  type    = string
+  default = null
+}
+
+variable "dd_api_key_secret_name" {
+  type    = string
+  default = null
+}
+
+variable "dd_agent_image" {
+  type    = string
+  default = null
+}
+
+variable "dd_fluentbit_image" {
+  type    = string
+  default = null
+}
+
+variable "dd_proxy_https" {
+  type    = string
+  default = null
+}
+
+variable "dd_proxy_no_proxy" {
+  type = list(string)
+
+  default = [
+    "localhost",
+    "127.0.0.1",
+    "169.254.169.254",
+    "169.254.170.2"
+  ]
+}
+
+
+###############################################################################
+# OPTIONAL DATADOG ECS FARGATE BOLT-ON
+###############################################################################
 
 locals {
-  datadog_agent = {
-    for name, td in var.ecs_task_definition :
+  datadog_enabled_tasks = {
+    for td_name, config in var.datadog_tasks :
+    td_name => config
+    if try(config.enabled, true)
+  }
+}
 
-    name => {
-      name      = "datadog-agent"
-      image     = td.datadog.agent_image
+
+###############################################################################
+# Validate mappings
+###############################################################################
+
+check "datadog_task_definitions_exist" {
+  assert {
+    condition = alltrue([
+      for td_name, config in local.datadog_enabled_tasks :
+      contains(keys(var.ecs_task_definition), td_name)
+    ])
+
+    error_message = "A datadog_tasks key does not exist in ecs_task_definition."
+  }
+}
+
+
+check "datadog_app_containers_exist" {
+  assert {
+    condition = alltrue([
+      for td_name, config in local.datadog_enabled_tasks :
+      contains(
+        keys(var.ecs_task_definition[td_name].container_definitions),
+        config.app_container_key
+      )
+    ])
+
+    error_message = "A Datadog app_container_key does not exist in the selected ECS task definition."
+  }
+}
+
+
+###############################################################################
+# Secrets Manager
+#
+# Terraform reads metadata / ARN only.
+# It does NOT retrieve the Datadog API key value.
+###############################################################################
+
+data "aws_secretsmanager_secret" "datadog_api_key" {
+  count = length(local.datadog_enabled_tasks) > 0 ? 1 : 0
+
+  name = var.dd_api_key_secret_name
+}
+
+
+###############################################################################
+# Execution role access to DD secret
+###############################################################################
+
+resource "aws_iam_role_policy" "datadog_secret_access" {
+  for_each = local.datadog_enabled_tasks
+
+  name = "datadog-secret-read-${lower(each.value.service)}"
+
+  role = each.value.execution_role_name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+
+    Statement = [
+      {
+        Sid    = "ReadDatadogApiKey"
+        Effect = "Allow"
+
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+
+        Resource = [
+          data.aws_secretsmanager_secret.datadog_api_key[0].arn
+        ]
+      }
+    ]
+  })
+}
+
+
+###############################################################################
+# Datadog container definitions
+###############################################################################
+
+locals {
+
+  ###########################################################################
+  # Agent proxy
+  ###########################################################################
+
+  dd_proxy_environment = var.dd_proxy_https == null ? [] : [
+    {
+      name  = "DD_PROXY_HTTP"
+      value = var.dd_proxy_https
+    },
+    {
+      name  = "DD_PROXY_HTTPS"
+      value = var.dd_proxy_https
+    },
+    {
+      name  = "DD_PROXY_NO_PROXY"
+      value = join(" ", var.dd_proxy_no_proxy)
+    },
+    {
+      name  = "DD_NO_PROXY_NONEXACT_MATCH"
+      value = "true"
+    }
+  ]
+
+
+  ###########################################################################
+  # Application Datadog environment
+  ###########################################################################
+
+  dd_app_environment = {
+    for td_name, config in local.datadog_enabled_tasks :
+
+    td_name => {
+      DD_ENV                     = var.environment_tag
+      DD_SERVICE                 = config.service
+      DD_VERSION                 = config.version
+
+      DD_TRACE_ENABLED           = "true"
+      DD_TRACE_AGENT_URL         = "http://127.0.0.1:8126"
+
+      DD_DOGSTATSD_URL           = "udp://127.0.0.1:8125"
+
+      DD_LOGS_INJECTION          = "true"
+      DD_RUNTIME_METRICS_ENABLED = "true"
+    }
+  }
+
+
+  ###########################################################################
+  # Unified Service Tagging labels
+  ###########################################################################
+
+  dd_app_labels = {
+    for td_name, config in local.datadog_enabled_tasks :
+
+    td_name => {
+      "com.datadoghq.tags.env"     = var.environment_tag
+      "com.datadoghq.tags.service" = config.service
+      "com.datadoghq.tags.version" = config.version
+    }
+  }
+
+
+  ###########################################################################
+  # Datadog Agent sidecar
+  ###########################################################################
+
+  dd_agent_containers = {
+    for td_name, config in local.datadog_enabled_tasks :
+
+    td_name => {
+      container_name = "datadog-agent"
+
+      image = var.dd_agent_image
+
+      # Datadog failure must not stop application task.
       essential = false
 
-      cpu    = 128
-      memory = 512
+      container_cpu    = 128
+      container_memory = 512
 
       environment = concat(
         [
@@ -78,7 +357,7 @@ locals {
           },
           {
             name  = "DD_SITE"
-            value = td.datadog.site
+            value = var.dd_site
           },
           {
             name  = "DD_ENV"
@@ -86,7 +365,11 @@ locals {
           },
           {
             name  = "DD_SERVICE"
-            value = td.datadog.service
+            value = config.service
+          },
+          {
+            name  = "DD_VERSION"
+            value = config.version
           },
           {
             name  = "DD_APM_ENABLED"
@@ -102,42 +385,18 @@ locals {
           }
         ],
 
-        try(td.datadog.proxy, null) == null ? [] : [
-          {
-            name  = "DD_PROXY_HTTP"
-            value = td.datadog.proxy
-          },
-          {
-            name  = "DD_PROXY_HTTPS"
-            value = td.datadog.proxy
-          },
-          {
-            name  = "DD_PROXY_NO_PROXY"
-            value = "localhost 127.0.0.1 169.254.169.254 169.254.170.2"
-          },
-          {
-            name  = "DD_NO_PROXY_NONEXACT_MATCH"
-            value = "true"
-          }
-        ]
+        local.dd_proxy_environment
       )
 
       secrets = [
         {
-          name      = "DD_API_KEY"
-          valueFrom = data.aws_secretsmanager_secret.datadog[name].arn
+          name = "DD_API_KEY"
+
+          valueFrom = data.aws_secretsmanager_secret.datadog_api_key[0].arn
         }
       ]
 
-      healthCheck = {
-        command     = ["CMD-SHELL", "agent health"]
-        interval    = 15
-        timeout     = 5
-        retries     = 3
-        startPeriod = 60
-      }
-
-      portMappings = [
+      port_mappings = [
         {
           containerPort = 8126
           hostPort      = 8126
@@ -149,8 +408,250 @@ locals {
           protocol      = "udp"
         }
       ]
-    }
 
-    if try(td.datadog.enabled, false)
+      health_check = {
+        command = [
+          "CMD-SHELL",
+          "agent health"
+        ]
+
+        interval     = 15
+        timeout      = 5
+        retries      = 3
+        start_period = 60
+      }
+
+      # Reuse existing application's CW log group for Agent diagnostics.
+      awslogs_group = var.ecs_task_definition[
+        td_name
+      ].container_definitions[
+        config.app_container_key
+      ].awslogs_group
+
+      awslogs_region = var.region
+
+      awslogs_stream_prefix = "datadog-agent"
+    }
+  }
+
+
+  ###########################################################################
+  # Fluent Bit FireLens sidecar
+  ###########################################################################
+
+  dd_log_router_containers = {
+    for td_name, config in local.datadog_enabled_tasks :
+
+    td_name => {
+      container_name = "log_router"
+
+      image = var.dd_fluentbit_image
+
+      essential = true
+
+      container_cpu    = 64
+      container_memory = 128
+
+      environment = []
+
+      firelens_configuration = {
+        type = "fluentbit"
+
+        options = {
+          "enable-ecs-log-metadata" = "true"
+        }
+      }
+
+      awslogs_group = var.ecs_task_definition[
+        td_name
+      ].container_definitions[
+        config.app_container_key
+      ].awslogs_group
+
+      awslogs_region = var.region
+
+      awslogs_stream_prefix = "fluentbit"
+    }
+  }
+
+
+  ###########################################################################
+  # Application FireLens configuration
+  ###########################################################################
+
+  dd_app_log_configuration = {
+    for td_name, config in local.datadog_enabled_tasks :
+
+    td_name => {
+      log_driver = "awsfirelens"
+
+      options = merge(
+        {
+          Name = "datadog"
+
+          Host = var.dd_logs_host
+
+          TLS      = "on"
+          compress = "gzip"
+
+          provider = "ecs"
+
+          dd_service = config.service
+          dd_source  = config.log_source
+
+          dd_message_key = "log"
+
+          dd_tags = join(",", [
+            "env:${var.environment_tag}",
+            "service:${config.service}",
+            "version:${config.version}"
+          ])
+        },
+
+        var.dd_proxy_https == null ? {} : {
+          proxy = var.dd_proxy_https
+        }
+      )
+
+      secret_options = [
+        {
+          name = "apikey"
+
+          valueFrom = data.aws_secretsmanager_secret.datadog_api_key[0].arn
+        }
+      ]
+    }
+  }
+
+
+  ###########################################################################
+  # FINAL ECS TASK DEFINITIONS
+  ###########################################################################
+
+  ecs_task_definition_effective = {
+
+    for td_name, td in var.ecs_task_definition :
+
+    td_name => contains(
+      keys(local.datadog_enabled_tasks),
+      td_name
+    ) ? merge(
+
+      td,
+
+      {
+        container_definitions = merge(
+
+          #####################################################################
+          # Existing containers
+          #####################################################################
+
+          {
+            for container_key, container in td.container_definitions :
+
+            container_key => (
+              container_key ==
+              local.datadog_enabled_tasks[td_name].app_container_key
+
+              ? merge(
+                  container,
+
+                  {
+                    ###########################################################
+                    # Preserve existing environment and add DD environment
+                    ###########################################################
+
+                    environment = [
+                      for env_name, env_value in merge(
+
+                        {
+                          for item in try(container.environment, []) :
+                          item.name => item.value
+                        },
+
+                        local.dd_app_environment[td_name]
+
+                      ) :
+
+                      {
+                        name  = env_name
+                        value = env_value
+                      }
+                    ]
+
+
+                    ###########################################################
+                    # Datadog Unified Service Tagging
+                    ###########################################################
+
+                    docker_labels = merge(
+                      try(container.docker_labels, {}),
+                      local.dd_app_labels[td_name]
+                    )
+
+
+                    ###########################################################
+                    # Start Fluent Bit before application
+                    ###########################################################
+
+                    depends_on = concat(
+                      try(container.depends_on, []),
+
+                      [
+                        {
+                          containerName = "log_router"
+                          condition     = "START"
+                        }
+                      ]
+                    )
+
+
+                    ###########################################################
+                    # Application logs -> FireLens -> Datadog
+                    ###########################################################
+
+                    log_configuration = local.dd_app_log_configuration[
+                      td_name
+                    ]
+                  }
+                )
+
+              : container
+            )
+          },
+
+
+          #####################################################################
+          # Add Agent
+          #####################################################################
+
+          {
+            "datadog-agent" = local.dd_agent_containers[
+              td_name
+            ]
+          },
+
+
+          #####################################################################
+          # Add Fluent Bit
+          #####################################################################
+
+          {
+            "log_router" = local.dd_log_router_containers[
+              td_name
+            ]
+          }
+        )
+      }
+    )
+
+    : td
   }
 }
+
+
+
+
+
+
+
