@@ -1,3 +1,58 @@
+variable "datadog_tasks" {
+  description = "Optional Datadog configuration keyed by ECS task definition name."
+
+  type = map(object({
+    app_container_name = string
+    service            = string
+    version            = optional(string, "unknown")
+    log_source         = optional(string, "ecs")
+  }))
+
+  default = {}
+}
+
+variable "dd_site" {
+  type    = string
+  default = "ddog-gov.com"
+}
+
+variable "dd_logs_host" {
+  type    = string
+  default = "http-intake.logs.ddog-gov.datadoghq.com"
+}
+
+variable "dd_api_key_secret_name" {
+  type    = string
+  default = null
+}
+
+variable "dd_agent_image" {
+  type    = string
+  default = null
+}
+
+variable "dd_fluentbit_image" {
+  type    = string
+  default = null
+}
+
+variable "dd_proxy_https" {
+  type    = string
+  default = null
+}
+
+variable "dd_proxy_no_proxy" {
+  type = list(string)
+
+  default = [
+    "localhost",
+    "127.0.0.1",
+    "169.254.169.254",
+    "169.254.170.2"
+  ]
+}
+
+
 ###############################################################################
 # OPTIONAL DATADOG BOLT-ON FOR ECS FARGATE
 ###############################################################################
@@ -17,7 +72,7 @@ data "aws_secretsmanager_secret" "datadog_api_key" {
 }
 
 ###############################################################################
-# ALLOW EXISTING ECS EXECUTION ROLE TO READ DATADOG API KEY
+# EXECUTION ROLE ACCESS TO DATADOG API KEY
 ###############################################################################
 
 resource "aws_iam_role_policy" "datadog_secret_access" {
@@ -56,13 +111,13 @@ resource "aws_iam_role_policy" "datadog_secret_access" {
 }
 
 ###############################################################################
-# DATADOG CONTAINER CONFIGURATION
+# DATADOG CONFIGURATION
 ###############################################################################
 
 locals {
 
   #############################################################################
-  # APPLICATION DATADOG ENVIRONMENT
+  # APP ENVIRONMENT
   #############################################################################
 
   dd_app_environment = {
@@ -82,7 +137,7 @@ locals {
   }
 
   #############################################################################
-  # APPLICATION DATADOG LABELS
+  # UNIFIED SERVICE TAGGING
   #############################################################################
 
   dd_app_labels = {
@@ -165,7 +220,7 @@ locals {
   }
 
   #############################################################################
-  # FLUENT BIT / FIRELENS
+  # FIRELENS / FLUENT BIT
   #############################################################################
 
   dd_log_router_containers = {
@@ -199,7 +254,7 @@ locals {
   }
 
   #############################################################################
-  # APPLICATION LOGGING -> FIRELENS -> DATADOG
+  # APP LOGGING -> FIRELENS -> DATADOG
   #############################################################################
 
   dd_app_log_configuration = {
@@ -241,7 +296,11 @@ locals {
   }
 
   #############################################################################
-  # BUILD ONLY THE TASK DEFINITIONS THAT NEED DATADOG
+  # BUILD DATADOG-ENABLED TASK DEFINITIONS
+  #
+  # IMPORTANT:
+  # We match config.app_container_name against cdef.container_name.
+  # We DO NOT use it as the container_definitions map key.
   #############################################################################
 
   datadog_task_definition_overrides = {
@@ -254,59 +313,42 @@ locals {
         container_definitions = merge(
 
           #####################################################################
-          # KEEP ALL EXISTING CONTAINERS
-          #####################################################################
-
-          var.ecs_task_definition[td_name].container_definitions,
-
-          #####################################################################
-          # MODIFY ONLY THE APPLICATION CONTAINER
+          # ALL EXISTING CONTAINERS EXCEPT TARGET APP
           #####################################################################
 
           {
-            (config.app_container_key) = merge(
-              var.ecs_task_definition[
-                td_name
-              ].container_definitions[
-                config.app_container_key
-              ],
+            for container_key, container
+            in var.ecs_task_definition[td_name].container_definitions :
+
+            container_key => container
+
+            if try(container.container_name, "") != config.app_container_name
+          },
+
+          #####################################################################
+          # TARGET APP CONTAINER - KEEP ORIGINAL MAP KEY
+          #####################################################################
+
+          {
+            for container_key, container
+            in var.ecs_task_definition[td_name].container_definitions :
+
+            container_key => merge(
+              container,
 
               {
                 environment = merge(
-                  try(
-                    var.ecs_task_definition[
-                      td_name
-                    ].container_definitions[
-                      config.app_container_key
-                    ].environment,
-                    {}
-                  ),
-
+                  try(container.environment, {}),
                   local.dd_app_environment[td_name]
                 )
 
                 docker_labels = merge(
-                  try(
-                    var.ecs_task_definition[
-                      td_name
-                    ].container_definitions[
-                      config.app_container_key
-                    ].docker_labels,
-                    {}
-                  ),
-
+                  try(container.docker_labels, {}),
                   local.dd_app_labels[td_name]
                 )
 
                 container_depends_on = concat(
-                  try(
-                    var.ecs_task_definition[
-                      td_name
-                    ].container_definitions[
-                      config.app_container_key
-                    ].container_depends_on,
-                    []
-                  ),
+                  try(container.container_depends_on, []),
 
                   [
                     {
@@ -316,31 +358,27 @@ locals {
                   ]
                 )
 
-                log_configuration = local.dd_app_log_configuration[
-                  td_name
-                ]
+                log_configuration = local.dd_app_log_configuration[td_name]
               }
             )
+
+            if try(container.container_name, "") == config.app_container_name
           },
 
           #####################################################################
-          # ADD DATADOG AGENT
+          # DATADOG AGENT
           #####################################################################
 
           {
-            "datadog-agent" = local.dd_agent_containers[
-              td_name
-            ]
+            "datadog-agent" = local.dd_agent_containers[td_name]
           },
 
           #####################################################################
-          # ADD FLUENT BIT
+          # FLUENT BIT
           #####################################################################
 
           {
-            "log_router" = local.dd_log_router_containers[
-              td_name
-            ]
+            "log_router" = local.dd_log_router_containers[td_name]
           }
         )
       }
@@ -348,14 +386,37 @@ locals {
   }
 
   #############################################################################
-  # FINAL TASK DEFINITIONS
-  #
-  # Non-Datadog TDs remain exactly as they are.
-  # Datadog TDs replace only their matching entry.
+  # FINAL ECS TASK DEFINITIONS
   #############################################################################
 
   ecs_task_definition_effective = merge(
     var.ecs_task_definition,
     local.datadog_task_definition_overrides
   )
+}
+
+
+
+
+
+
+
+variable "datadog_tasks" {
+  type = map(object({
+    app_container_name = string
+    service            = string
+    version            = optional(string, "unknown")
+    log_source         = optional(string, "ecs")
+  }))
+
+  default = {}
+}
+
+datadog_tasks = {
+  "FATW-Dev-Backend-TD" = {
+    app_container_name = "FATW-Dev-Backend-CB"
+    service            = "backend-service"
+    version            = "1.0.0"
+    log_source         = "php"
+  }
 }
