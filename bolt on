@@ -1,9 +1,69 @@
+###############################################################################
+# OPTIONAL DATADOG BOLT-ON FOR ECS FARGATE
+###############################################################################
+
 locals {
-  datadog_enabled_tasks = {
-    for td_name, config in var.datadog_tasks :
-    td_name => config
-    if try(config.enabled, true)
-  }
+  datadog_enabled_tasks = var.datadog_tasks
+}
+
+###############################################################################
+# Datadog API key secret
+###############################################################################
+
+data "aws_secretsmanager_secret" "datadog_api_key" {
+  count = length(local.datadog_enabled_tasks) > 0 ? 1 : 0
+
+  name = var.dd_api_key_secret_name
+}
+
+###############################################################################
+# Allow the EXISTING ECS execution role to retrieve the Datadog API key
+###############################################################################
+
+resource "aws_iam_role_policy" "datadog_secret_access" {
+  for_each = local.datadog_enabled_tasks
+
+  name = "datadog-secret-read-${lower(each.value.service)}"
+
+  role = element(
+    reverse(
+      split(
+        "/",
+        var.ecs_task_definition[each.key].task_execution_role
+      )
+    ),
+    0
+  )
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+
+    Statement = [
+      {
+        Sid    = "ReadDatadogApiKey"
+        Effect = "Allow"
+
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+
+        Resource = [
+          data.aws_secretsmanager_secret.datadog_api_key[0].arn
+        ]
+      }
+    ]
+  })
+}
+
+###############################################################################
+# Datadog configuration
+###############################################################################
+
+locals {
+
+  /////////////////////////////////////////////////////////////////////////////
+  # App environment variables
+  /////////////////////////////////////////////////////////////////////////////
 
   dd_app_environment = {
     for td_name, config in local.datadog_enabled_tasks :
@@ -12,13 +72,185 @@ locals {
       DD_ENV                     = var.environment_tag
       DD_SERVICE                 = config.service
       DD_VERSION                 = config.version
+      DD_AGENT_HOST              = "127.0.0.1"
       DD_TRACE_ENABLED           = "true"
-      DD_TRACE_AGENT_URL         = "http://127.0.0.1:8126"
-      DD_DOGSTATSD_URL           = "udp://127.0.0.1:8125"
+      DD_TRACE_AGENT_PORT        = "8126"
+      DD_DOGSTATSD_PORT          = "8125"
       DD_LOGS_INJECTION          = "true"
       DD_RUNTIME_METRICS_ENABLED = "true"
     }
   }
+
+  /////////////////////////////////////////////////////////////////////////////
+  # Unified Service Tagging labels
+  /////////////////////////////////////////////////////////////////////////////
+
+  dd_app_labels = {
+    for td_name, config in local.datadog_enabled_tasks :
+
+    td_name => {
+      "com.datadoghq.tags.env"     = var.environment_tag
+      "com.datadoghq.tags.service" = config.service
+      "com.datadoghq.tags.version" = config.version
+    }
+  }
+
+  /////////////////////////////////////////////////////////////////////////////
+  # Datadog Agent container
+  /////////////////////////////////////////////////////////////////////////////
+
+  dd_agent_containers = {
+    for td_name, config in local.datadog_enabled_tasks :
+
+    td_name => {
+      container_name = "datadog-agent"
+      image          = var.dd_agent_image
+      essential      = false
+
+      environment = merge(
+        {
+          ECS_FARGATE                      = "true"
+          DD_SITE                          = var.dd_site
+          DD_ENV                           = var.environment_tag
+          DD_SERVICE                       = config.service
+          DD_VERSION                       = config.version
+          DD_APM_ENABLED                   = "true"
+          DD_APM_NON_LOCAL_TRAFFIC         = "true"
+          DD_DOGSTATSD_NON_LOCAL_TRAFFIC   = "true"
+          DD_DOGSTATSD_TAG_CARDINALITY     = "orchestrator"
+        },
+
+        var.dd_proxy_https != null ? {
+          DD_PROXY_HTTP              = var.dd_proxy_https
+          DD_PROXY_HTTPS             = var.dd_proxy_https
+          DD_PROXY_NO_PROXY          = join(" ", var.dd_proxy_no_proxy)
+          DD_NO_PROXY_NONEXACT_MATCH = "true"
+        } : {}
+      )
+
+      secrets = [
+        {
+          name      = "DD_API_KEY"
+          valueFrom = data.aws_secretsmanager_secret.datadog_api_key[0].arn
+        }
+      ]
+
+      port_mappings = [
+        {
+          containerPort = 8126
+          hostPort      = 8126
+          protocol      = "tcp"
+        },
+        {
+          containerPort = 8125
+          hostPort      = 8125
+          protocol      = "udp"
+        }
+      ]
+
+      health_check = {
+        command     = ["CMD-SHELL", "agent health"]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 15
+      }
+
+      container_depends_on = []
+
+      firelens_configuration = null
+
+      log_configuration = null
+
+      docker_labels = {}
+
+      mount_points = []
+    }
+  }
+
+  /////////////////////////////////////////////////////////////////////////////
+  # FireLens / Fluent Bit container
+  /////////////////////////////////////////////////////////////////////////////
+
+  dd_log_router_containers = {
+    for td_name, config in local.datadog_enabled_tasks :
+
+    td_name => {
+      container_name = "log_router"
+      image          = var.dd_fluentbit_image
+      essential      = true
+
+      environment = {}
+
+      secrets = []
+
+      port_mappings = []
+
+      health_check = null
+
+      container_depends_on = []
+
+      firelens_configuration = {
+        type = "fluentbit"
+
+        options = {
+          "enable-ecs-log-metadata" = "true"
+        }
+      }
+
+      log_configuration = null
+
+      docker_labels = {}
+
+      mount_points = []
+    }
+  }
+
+  /////////////////////////////////////////////////////////////////////////////
+  # App -> FireLens -> Datadog
+  /////////////////////////////////////////////////////////////////////////////
+
+  dd_app_log_configuration = {
+    for td_name, config in local.datadog_enabled_tasks :
+
+    td_name => {
+      logDriver = "awsfirelens"
+
+      options = merge(
+        {
+          Name           = "datadog"
+          Host           = var.dd_logs_host
+          TLS            = "on"
+          compress       = "gzip"
+          provider       = "ecs"
+          dd_service     = config.service
+          dd_source      = config.log_source
+          dd_message_key = "log"
+
+          dd_tags = join(",", [
+            "env:${var.environment_tag}",
+            "service:${config.service}",
+            "version:${config.version}"
+          ])
+        },
+
+        var.dd_proxy_https != null ? {
+          proxy = var.dd_proxy_https
+        } : {}
+      )
+
+      secretOptions = [
+        {
+          name      = "apikey"
+          valueFrom = data.aws_secretsmanager_secret.datadog_api_key[0].arn
+        }
+      ]
+    }
+  }
+
+  /////////////////////////////////////////////////////////////////////////////
+  # FINAL task definitions
+  /////////////////////////////////////////////////////////////////////////////
 
   ecs_task_definition_effective = {
     for td_name, td in var.ecs_task_definition :
@@ -30,11 +262,14 @@ locals {
       td,
       {
         container_definitions = merge(
+
+          # Existing application container(s)
           {
             for container_key, container in td.container_definitions :
 
             container_key => (
               container_key == local.datadog_enabled_tasks[td_name].app_container_key
+
               ? merge(
                   container,
                   {
@@ -42,16 +277,36 @@ locals {
                       try(container.environment, {}),
                       local.dd_app_environment[td_name]
                     )
+
+                    docker_labels = merge(
+                      try(container.docker_labels, {}),
+                      local.dd_app_labels[td_name]
+                    )
+
+                    container_depends_on = concat(
+                      try(container.container_depends_on, []),
+                      [
+                        {
+                          containerName = "log_router"
+                          condition     = "START"
+                        }
+                      ]
+                    )
+
+                    log_configuration = local.dd_app_log_configuration[td_name]
                   }
                 )
+
               : container
             )
           },
 
+          # Add Datadog Agent
           {
             "datadog-agent" = local.dd_agent_containers[td_name]
           },
 
+          # Add Fluent Bit
           {
             "log_router" = local.dd_log_router_containers[td_name]
           }
