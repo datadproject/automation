@@ -1,0 +1,12 @@
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+crash.log
+# Never commit the Datadog-generated worker configuration.
+synthetics-check-runner.json
+**/synthetics-check-runner.json
+
+# Local rendered Helm output, if generated for troubleshooting.
+rendered*.yaml

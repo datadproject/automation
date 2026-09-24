@@ -1,5 +1,10 @@
 # Datadog on FATW ECS — additive, prod-safe
 
+> Current logging architecture: keep FE/BE on `awslogs` and use the separate
+> [shared Forwarder](../datadog-forwarder-module/README.md). Consumers now set
+> `enable_logs = false` while retaining APM. The older Tier B/FireLens rollout
+> below is superseded; do not follow it for this integration.
+
 Two constraints shaped everything here:
 
 1. **It is deployed to prod.** Nothing currently running may change.

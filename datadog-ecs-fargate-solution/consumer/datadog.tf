@@ -13,10 +13,10 @@ module "datadog_backend" {
   fluentbit_image               = var.dd_fluentbit_image
   enable_apm                    = true
   enable_dogstatsd              = false
-  enable_logs                   = var.dd_enable_logs
+  enable_logs                   = false # Keep awslogs; logs use the shared Forwarder.
   agent_essential               = false
   app_wait_for_agent            = false
-  app_depends_on_log_router     = true
+  app_depends_on_log_router     = false
   agent_proxy_https             = var.dd_agent_proxy_https
   agent_proxy_http              = var.dd_agent_proxy_http
   agent_proxy_no_proxy          = var.dd_agent_proxy_no_proxy

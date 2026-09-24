@@ -51,7 +51,7 @@ module "datadog" {
   # module unpatched, set dd_enable_logs = false on the service in tfvars --
   # metrics and APM work with no module change at all.
   enable_apm       = try(each.value.dd_enable_apm, true)
-  enable_logs      = try(each.value.dd_enable_logs, true)
+  enable_logs      = false # Keep awslogs; logs use the shared Forwarder.
   enable_dogstatsd = try(each.value.dd_enable_dogstatsd, true)
   enable_profiling = try(each.value.dd_enable_profiling, false)
   log_source       = try(each.value.dd_log_source, var.dd_log_source)

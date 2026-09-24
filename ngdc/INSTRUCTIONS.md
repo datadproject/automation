@@ -1,5 +1,9 @@
 # Step-by-step
 
+> For logs, use the [shared Forwarder](../datadog-forwarder-module/README.md).
+> Keep the sidecar's `enable_logs = false` and FE/BE on `awslogs`. Step 10's
+> older Tier B/FireLens rollout is superseded by this architecture.
+
 Dev first. Do not touch test/stage/prod until dev is verified.
 
 ## Step 0 — Three answers

@@ -1,5 +1,10 @@
 # Datadog sidecar for an existing ECS Fargate service
 
+> Current logging architecture: keep `awslogs` and use the
+> [shared Forwarder](../datadog-forwarder-module/README.md). The consumer now
+> disables FireLens while preserving APM. The older instructions below to
+> enable FireLens are superseded for this integration.
+
 This package matches the three-layer structure shown in the screenshots:
 
 1. `consumer/` - the FATW ECS repository.

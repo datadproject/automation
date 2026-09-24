@@ -1,0 +1,15 @@
+aws_region             = "us-gov-west-1"
+application            = "fatw"
+forwarder_function_name = "fatw-datadog-forwarder"
+dd_api_key_secret_name = "REPLACE_ME"
+vpc_id                 = "vpc-REPLACE_ME"
+private_subnet_ids      = ["subnet-REPLACE_ME-1", "subnet-REPLACE_ME-2"]
+proxy_url               = "http://10.111.225.254:8080"
+proxy_cidr              = "10.111.225.254/32"
+
+ecs_log_groups = {
+  dev  = "/ecs/NGDC-FATW-ECS-CLUSTER"
+  qa   = "/ecs/REPLACE-QA-ECS-CLUSTER"
+  uat  = "/ecs/REPLACE-UAT-ECS-CLUSTER"
+  prod = "/ecs/REPLACE-PROD-ECS-CLUSTER"
+}
