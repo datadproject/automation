@@ -8,9 +8,12 @@ This package is separate from both ECS fragment modules. FE/BE containers keep
 examples now explicitly disable their legacy FireLens option. Do not enable
 `dd_enable_logs` or add a `log_router` for this architecture.
 
-- [Reusable wrapper](modules/datadog-forwarder/README.md), using official
-  `DataDog/log-lambda-forwarder-datadog/aws` version `2.0.4`.
-- [Shared environment example](examples/forwarder-multi-env/main.tf).
+- [Shared deployment](examples/forwarder-multi-env/main.tf) calls the official
+  `DataDog/log-lambda-forwarder-datadog/aws` version `2.0.4` directly, with the
+  security group and subscriptions alongside it.
+- [Runner setup and verification](RUNNER.md).
+- The original custom wrapper remains for compatibility; the shared deployment
+  no longer calls it.
 
 Deploy one instance per AWS account/region from shared infrastructure state,
 not one instance per ECS service. Pass all relevant DEV/QA/UAT/PROD log groups

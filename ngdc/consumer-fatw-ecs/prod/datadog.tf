@@ -17,10 +17,9 @@ module "datadog" {
   # block. If you get "Module is incompatible with count, for_each, and
   # depends_on", a provider block has been added to the module -- delete it.
   #
-  # Source comes from a variable so the git ref is set in ecs.tfvars.
-  # Move off a branch ref to a TAG before prod: a push to the branch changes
-  # every consumer's next apply.
-  source = var.dd_module_source
+  # Terraform 1.9-1.13 requires a literal source. Use the bundled sidecar.
+  # When copying into another repository, use its literal path or a pinned Git URL.
+  source = "../../ngdc-datadog-ecs-sidecar-module"
 
   aws_region = var.aws_region
 

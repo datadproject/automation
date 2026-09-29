@@ -106,7 +106,7 @@ variable "enable_logs" {
     stop arriving in CloudWatch. Check retention/audit requirements first.
   EOT
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "fluentbit_image" {

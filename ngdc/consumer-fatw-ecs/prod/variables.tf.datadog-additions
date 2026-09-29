@@ -8,14 +8,14 @@ variable "dd_module_source" {
   description = <<-EOT
     Source of ngdc-datadog-ecs-sidecar-module.
 
-    Terraform requires module source to be a literal in most cases; a variable
-    works here only because the value is constant per environment. If your
-    Terraform version rejects it, inline the string in datadog.tf instead.
+    Deprecated compatibility input; datadog.tf uses a literal source.
+    Terraform 1.9-1.13 does not accept a variable for module source.
 
     Move off a branch ref to a TAG before prod -- a push to the branch would
     change every consumer's next apply.
   EOT
   type        = string
+  default     = null
 }
 
 variable "image_tag" {

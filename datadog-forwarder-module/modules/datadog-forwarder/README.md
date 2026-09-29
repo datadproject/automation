@@ -1,5 +1,9 @@
 # Reusable Datadog Forwarder Wrapper
 
+Compatibility wrapper from the first integration. The recommended
+[shared deployment](../../examples/forwarder-multi-env/main.tf) now calls the
+official Datadog module directly and does not use this wrapper.
+
 Reusable wrapper around Datadog's official AWS Log Lambda Forwarder Terraform module.
 
 ## Design
