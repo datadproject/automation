@@ -1,0 +1,21 @@
+###############################################################################
+# DATADOG LAMBDA FORWARDER - ENVIRONMENT VALUES
+###############################################################################
+
+dd_log_group_name = "/ecs/YOUR-BACKEND-LOG-GROUP"
+
+dd_forwarder_subnet_ids = [
+  "subnet-REPLACE-ME-1",
+  "subnet-REPLACE-ME-2"
+]
+
+dd_forwarder_security_group_ids = [
+  "sg-REPLACE-ME"
+]
+
+dd_forwarder_no_proxy = [
+  "localhost",
+  "127.0.0.1",
+  "169.254.169.254",
+  "169.254.170.2"
+]
